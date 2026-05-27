@@ -1,18 +1,33 @@
-#include <string.h>
-#include <vulkan/vulkan_core.h>
-#define GLFW_INCLUDE_VULKAN
-#include <GLFW/glfw3.h>
-
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#include <vulkan/vulkan_core.h>
+#define GLFW_INCLUDE_VULKAN
+
+#include <GLFW/glfw3.h>
+
+#include "base.c"
+
+#define VK_ENABLE_VALIDATION
+#ifdef VK_ENABLE_VALIDATION
+static const bool is_validation_enabled = 1;
+char const *validation_layer_names[] = {"VK_LAYER_KHRONOS_validation"};
+const int validation_layer_count =
+    sizeof(validation_layer_names) / sizeof(validation_layer_names[0]);
+
+#else
+static const bool is_validation_enabled = 0;
+#endif
 
 typedef struct HelloTriangleApplication {
   GLFWwindow *window;
   VkInstance *instance;
 } HelloTriangleApplication;
 
-void validate_ext(uint32_t *extension_count,
-                  const char *const **extension_names);
+void get_extensions(uint32_t *extension_count, const char ***extension_names);
+void get_layers(uint32_t *layer_count, const char ***layer_properties);
 
 //@ Init
 static int initVulkan(HelloTriangleApplication *app) {
@@ -22,6 +37,9 @@ static int initVulkan(HelloTriangleApplication *app) {
   VkDevice device = VK_NULL_HANDLE;
   VkBuffer buffer = VK_NULL_HANDLE;
 
+  uint32_t required_layer_count = 0;
+  const char **required_layers = NULL;
+
   const VkApplicationInfo appInfo = {.pApplicationName = "Hello Triangle",
                                      .applicationVersion =
                                          VK_MAKE_VERSION(1, 0, 0),
@@ -30,15 +48,22 @@ static int initVulkan(HelloTriangleApplication *app) {
                                      .apiVersion = VK_API_VERSION_1_4};
 
   uint32_t extension_count;
-  const char *const *extension_names = NULL;
-  validate_ext(&extension_count, &extension_names);
+  const char **extension_names = NULL;
+  get_extensions(&extension_count, &extension_names);
+
+  uint32_t layer_count;
+  const char **layer_names = NULL;
+  get_layers(&layer_count, &layer_names);
 
   // instance
   const VkInstanceCreateInfo createInfo = {
       .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
       .pApplicationInfo = &appInfo,
       .enabledExtensionCount = extension_count,
-      .ppEnabledExtensionNames = extension_names};
+      .ppEnabledExtensionNames = extension_names,
+      .enabledLayerCount = layer_count,
+      .ppEnabledLayerNames = layer_names,
+  };
 
   VkResult result = vkCreateInstance(&createInfo, NULL, &instance);
 
@@ -157,8 +182,6 @@ static int run(HelloTriangleApplication *app) { return 0; }
 int main(void) {
   HelloTriangleApplication app = {0};
 
-  printf("Hello World !\n");
-
   if (initWindow(&app) != 0)
     return EXIT_FAILURE;
 
@@ -171,48 +194,122 @@ int main(void) {
   return EXIT_SUCCESS;
 }
 
-void validate_ext(uint32_t *extension_count,
-                  const char *const **extension_names) {
-  // expected ext by glfw
-  *extension_count = 0;
-  *extension_names = glfwGetRequiredInstanceExtensions(extension_count);
-  if (*extension_names == NULL) {
-    fprintf(stderr, "Failed to get GLFW required extensions\n");
-    exit(EXIT_FAILURE);
+bool has_ext(uint32_t actual_count, VkExtensionProperties *actual_props,
+             const char *const expected) {
+  for (uint32_t j = 0; j < actual_count; ++j) {
+    if (strcmp(expected, actual_props[j].extensionName) == 0) {
+      printf("extension %s found.\n", expected);
+      return true;
+    }
   }
-
+  fprintf(stderr, "Required extension not supported: %s\n", expected);
+  return false;
+}
+void get_extensions(uint32_t *extension_count, const char ***extension_names) {
   // actual ext of vk
-  uint32_t vk_extension_count = 0;
-  vkEnumerateInstanceExtensionProperties(NULL, &vk_extension_count, NULL);
-  VkExtensionProperties *extension_properties =
-      malloc(sizeof(VkExtensionProperties) * vk_extension_count);
-  if (extension_properties == NULL) {
+  uint32_t vk_available_extension_count = 0;
+  vkEnumerateInstanceExtensionProperties(NULL, &vk_available_extension_count,
+                                         NULL);
+  VkExtensionProperties *vk_available_extension_properties =
+      malloc(sizeof(VkExtensionProperties) * vk_available_extension_count);
+  if (vk_available_extension_properties == NULL) {
     fprintf(stderr, "Out of memory\n");
     exit(EXIT_FAILURE);
   }
-  vkEnumerateInstanceExtensionProperties(NULL, &vk_extension_count,
-                                         extension_properties);
+  vkEnumerateInstanceExtensionProperties(NULL, &vk_available_extension_count,
+                                         vk_available_extension_properties);
 
-  // compare
-  for (uint32_t i = 0; i < *extension_count; ++i) {
-    int found = 0;
-
-    for (uint32_t j = 0; j < vk_extension_count; ++j) {
-      if (strcmp((*extension_names)[i],
-                 extension_properties[j].extensionName) == 0) {
-        printf("glfw expected %s: found.\n", (*extension_names)[i]);
-        found = 1;
-        break;
-      }
-    }
-
-    if (!found) {
-      fprintf(stderr, "Required GLFW extension not supported: %s\n",
-              (*extension_names)[i]);
-
-      free(extension_properties);
-
-      exit(EXIT_FAILURE);
+  // expected ext by glfw
+  uint32_t glfw_extension_count = 0; // TODO change
+  const char **glfw_extension_names =
+      glfwGetRequiredInstanceExtensions(&glfw_extension_count);
+  if (glfw_extension_names == NULL) {
+    fprintf(stderr, "Failed to get GLFW required extensions\n");
+    exit(EXIT_FAILURE);
+  }
+  for (uint32_t i = 0; i < glfw_extension_count; ++i) {
+    if (!has_ext(vk_available_extension_count,
+                 vk_available_extension_properties,
+                 (glfw_extension_names)[i])) {
+      goto ext_not_found;
     }
   }
+
+  // extra
+  int extra_extension_count = 0;
+  if (is_validation_enabled) {
+    extra_extension_count++;
+    if (!has_ext(vk_available_extension_count,
+                 vk_available_extension_properties,
+                 VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+      goto ext_not_found;
+    }
+  }
+
+  *extension_count = glfw_extension_count + extra_extension_count;
+  *extension_names = malloc(sizeof(**extension_names) * *extension_count);
+  memcpy(*extension_names, glfw_extension_names,
+         sizeof(*glfw_extension_names) * glfw_extension_count);
+  (*extension_names)[glfw_extension_count] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+
+  return;
+
+// TODO: add portability
+ext_not_found:
+  if (vk_available_extension_properties) {
+    free(vk_available_extension_properties);
+  }
+
+  exit(EXIT_FAILURE);
+}
+
+bool has_layer(uint32_t actual_count, VkLayerProperties *actual_props,
+               const char *const expected) {
+  for (int i = 0; i < actual_count; i++) {
+    if (strcmp(actual_props[i].layerName, expected) == 0) {
+      printf("layer %s found.\n", expected);
+      return true;
+    }
+  }
+  fprintf(stderr, "Required layer do not exist: %s\n", expected);
+  return false;
+}
+void get_layers(uint32_t *layer_count, const char ***layer_names) {
+  uint32_t required_layer_count = 0;
+  const char **required_layer_names = NULL;
+  if (is_validation_enabled) {
+    required_layer_count = validation_layer_count;
+    required_layer_names =
+        malloc(sizeof(*required_layer_names) * required_layer_count);
+
+    memcpy(required_layer_names, validation_layer_names,
+           sizeof(validation_layer_names) * validation_layer_count);
+  }
+
+  uint32_t vk_layer_count;
+  vkEnumerateInstanceLayerProperties(&vk_layer_count, NULL);
+  VkLayerProperties *vk_layer_properties =
+      malloc(sizeof(VkLayerProperties) * vk_layer_count);
+  if (vk_layer_properties == NULL) {
+    fprintf(stderr, "Out of memory\n");
+    exit(EXIT_FAILURE);
+  }
+  vkEnumerateInstanceLayerProperties(&vk_layer_count, vk_layer_properties);
+
+  for (int i = 0; i < required_layer_count; i++) {
+    if (!has_layer(*layer_count, vk_layer_properties,
+                   required_layer_names[i])) {
+      goto layer_not_found;
+    }
+  }
+  *layer_count = required_layer_count;
+  *layer_names = required_layer_names;
+
+  return;
+
+layer_not_found:
+  if (vk_layer_properties) {
+    free(vk_layer_properties);
+  }
+  exit(EXIT_FAILURE);
 }
