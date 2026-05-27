@@ -27,15 +27,18 @@ typedef struct HelloTriangleApplication {
 } HelloTriangleApplication;
 
 void get_extensions(uint32_t *extension_count, const char ***extension_names);
+bool has_extension(uint32_t actual_count, VkExtensionProperties *actual_props,
+                   const char *const expected);
 void get_layers(uint32_t *layer_count, const char ***layer_properties);
 
 //@ Init
 static int initVulkan(HelloTriangleApplication *app) {
-
+  VkResult result = VK_SUCCESS;
   VkInstance instance = VK_NULL_HANDLE;
   VkPhysicalDevice physical_device = VK_NULL_HANDLE;
   VkDevice device = VK_NULL_HANDLE;
   VkBuffer buffer = VK_NULL_HANDLE;
+  VkQueue graphic_queue = VK_NULL_HANDLE;
 
   uint32_t required_layer_count = 0;
   const char **required_layers = NULL;
@@ -47,81 +50,187 @@ static int initVulkan(HelloTriangleApplication *app) {
                                      .engineVersion = VK_MAKE_VERSION(1, 0, 0),
                                      .apiVersion = VK_API_VERSION_1_4};
 
-  uint32_t extension_count;
-  const char **extension_names = NULL;
-  get_extensions(&extension_count, &extension_names);
+  // @instance
+  {
+    uint32_t extension_count;
+    const char **extension_names = NULL;
+    get_extensions(&extension_count, &extension_names);
 
-  uint32_t layer_count;
-  const char **layer_names = NULL;
-  get_layers(&layer_count, &layer_names);
+    uint32_t layer_count;
+    const char **layer_names = NULL;
+    get_layers(&layer_count, &layer_names);
+    const VkInstanceCreateInfo createInfo = {
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &appInfo,
+        .enabledExtensionCount = extension_count,
+        .ppEnabledExtensionNames = extension_names,
+        .enabledLayerCount = layer_count,
+        .ppEnabledLayerNames = layer_names,
+    };
 
-  // instance
-  const VkInstanceCreateInfo createInfo = {
-      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-      .pApplicationInfo = &appInfo,
-      .enabledExtensionCount = extension_count,
-      .ppEnabledExtensionNames = extension_names,
-      .enabledLayerCount = layer_count,
-      .ppEnabledLayerNames = layer_names,
-  };
+    result = vkCreateInstance(&createInfo, NULL, &instance);
 
-  VkResult result = vkCreateInstance(&createInfo, NULL, &instance);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: failed to create instance\n");
+      goto cleanup;
+    }
 
-  if (result != VK_SUCCESS) {
-    fprintf(stderr, "Vulkan error: failed to create instance\n");
-    goto cleanup;
+    printf("vk::Instance created\n");
+  }
   }
 
-  printf("vk::Instance created\n");
+  // @physical device
+  uint32_t graphic_queue_index = UINT32_MAX;
+  VkPhysicalDeviceFeatures2 device_features;
+  const char *required_device_extension_names[] = {
+      VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+  const uint32_t required_device_extension_count =
+      sizeof(required_device_extension_names) /
+      sizeof(required_device_extension_names[0]);
+  {
+    uint32_t physical_device_count = 0;
+    result = vkEnumeratePhysicalDevices(instance, &physical_device_count, NULL);
+    if (result != VK_SUCCESS || physical_device_count == 0) {
+      fprintf(stderr, "Vulkan error: no physical device found\n");
+      goto cleanup;
+    }
+    VkPhysicalDevice *physical_devices =
+        malloc(sizeof(*physical_devices) * physical_device_count);
+    if (physical_devices == NULL) {
+      fprintf(stderr, "Error: out of memory\n");
+      goto cleanup;
+    }
+    result = vkEnumeratePhysicalDevices(instance, &physical_device_count,
+                                        physical_devices);
 
-  // physical device
-  uint32_t physical_device_count = 0;
-  result = vkEnumeratePhysicalDevices(instance, &physical_device_count, NULL);
-  if (result != VK_SUCCESS || physical_device_count == 0) {
-    fprintf(stderr, "Vulkan error: no physical device found\n");
-    goto cleanup;
-  }
-  VkPhysicalDevice *physical_devices =
-      malloc(sizeof(*physical_devices) * physical_device_count);
-  if (physical_devices == NULL) {
-    fprintf(stderr, "Error: out of memory\n");
-    goto cleanup;
-  }
-  result = vkEnumeratePhysicalDevices(instance, &physical_device_count,
-                                      physical_devices);
-
-  if (result != VK_SUCCESS) {
-    fprintf(stderr, "Vulkan error: failed to enumerate physical devices\n");
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: failed to enumerate physical devices\n");
+      free(physical_devices);
+      goto cleanup;
+    }
+    physical_device = physical_devices[0];
     free(physical_devices);
-    goto cleanup;
-  }
-  physical_device = physical_devices[0];
-  free(physical_devices);
 
-  printf("vk::PhysicalDevice created\n");
+    // verify 1.3 support
+    VkPhysicalDeviceProperties2 physical_device_properties = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    vkGetPhysicalDeviceProperties2(physical_device,
+                                   &physical_device_properties);
+    if (physical_device_properties.properties.apiVersion < VK_API_VERSION_1_3) {
+      fprintf(stderr, "Vulkan error: physical device do not support 1.3.");
+      goto cleanup;
+    }
 
-  // logical device
-  VkDeviceCreateInfo device_info = {.sType =
-                                        VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-  result = vkCreateDevice(physical_device, &device_info, NULL, &device);
-  if (result != VK_SUCCESS) {
-    fprintf(stderr, "Vulkan error: failed to create logical device\n");
-    goto cleanup;
-  }
-  printf("vk::LogicalDevice created\n");
+    // verify graphic queue
+    uint32_t physical_device_queue_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(
+        physical_device, &physical_device_queue_count, NULL);
+    VkQueueFamilyProperties *physical_device_queue_properties =
+        malloc(sizeof(VkQueueFamilyProperties) * physical_device_queue_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device,
+                                             &physical_device_queue_count,
+                                             physical_device_queue_properties);
+    bool supports_graphic_queue = false;
+    for (uint32_t i = 0; i < physical_device_queue_count; ++i) {
+      printf("%i => %u\n", i, physical_device_queue_properties[i].queueFlags);
+      if (physical_device_queue_properties[i].queueFlags &
+          VK_QUEUE_GRAPHICS_BIT) {
+        supports_graphic_queue = true;
+        break;
+      }
+    }
+    if (!supports_graphic_queue) {
+      fprintf(stderr,
+              "Vulkan error: physical device does not support graphic queue\n");
+      goto cleanup;
+    }
 
-  // buffer
-  VkBufferCreateInfo buffer_info = {.sType =
-                                        VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                                    .size = 1024,
-                                    .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-  result = vkCreateBuffer(device, &buffer_info, NULL, &buffer);
-  if (result != VK_SUCCESS) {
-    fprintf(stderr, "Vulkan error: failed to create buffer\n");
-    goto cleanup;
+    // verify swapchain extension
+    uint32_t extension_count = 0;
+    vkEnumerateDeviceExtensionProperties(physical_device, NULL,
+                                         &extension_count, NULL);
+    VkExtensionProperties *extension_properties =
+        malloc(sizeof(VkExtensionProperties) * extension_count);
+    vkEnumerateDeviceExtensionProperties(
+        physical_device, NULL, &extension_count, extension_properties);
+
+    bool supports_swapchain = false;
+    for (int i = 0; i < required_device_extension_count; i++) {
+      if (has_extension(extension_count, extension_properties,
+                        required_device_extension_names[i])) {
+        supports_swapchain = true;
+        break;
+      }
+    }
+    if (!supports_swapchain) {
+      fprintf(stderr,
+              "Vulkan error: physical device does not support swapchain\n");
+      goto cleanup;
+    }
+
+    // verify dynamic rendering feature
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features =
+        {.sType =
+             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+    VkPhysicalDeviceVulkan13Features vulkan13_features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .pNext = &extended_dynamic_state_features};
+    device_features = (VkPhysicalDeviceFeatures2){
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &vulkan13_features};
+    vkGetPhysicalDeviceFeatures2(physical_device, &device_features);
+
+    if (!vulkan13_features.dynamicRendering ||
+        !extended_dynamic_state_features.extendedDynamicState) {
+      fprintf(stderr,
+              "Vulkan error: physical device does not dynamic rendering\n");
+      goto cleanup;
+    }
+
+    printf("vk::PhysicalDevice created\n");
   }
-  printf("vk::Buffer created\n");
+
+  // @logical device
+  {
+    float queue_priority = 1.0f;
+    VkDeviceQueueCreateInfo device_queue_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .pNext = &device_features,
+        .queueCount = 1,
+        .pQueuePriorities = &queue_priority,
+        .queueFamilyIndex = graphic_queue_index};
+    VkDeviceCreateInfo device_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &device_features,
+        .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = &device_queue_info,
+        .enabledExtensionCount = required_device_extension_count,
+        .ppEnabledExtensionNames = required_device_extension_names};
+    result = vkCreateDevice(physical_device, &device_info, NULL, &device);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: failed to create logical device\n");
+      goto cleanup;
+    }
+
+    vkGetDeviceQueue(device, graphic_queue_index, 0, &graphic_queue);
+
+    printf("vk::LogicalDevice (and queue handle) created\n");
+  }
+
+  // @buffer
+  {
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = 1024,
+        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    result = vkCreateBuffer(device, &buffer_info, NULL, &buffer);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: failed to create buffer\n");
+      goto cleanup;
+    }
+    printf("vk::Buffer created\n");
+  }
 
   return 0;
 
@@ -194,8 +303,8 @@ int main(void) {
   return EXIT_SUCCESS;
 }
 
-bool has_ext(uint32_t actual_count, VkExtensionProperties *actual_props,
-             const char *const expected) {
+bool has_extension(uint32_t actual_count, VkExtensionProperties *actual_props,
+                   const char *const expected) {
   for (uint32_t j = 0; j < actual_count; ++j) {
     if (strcmp(expected, actual_props[j].extensionName) == 0) {
       printf("extension %s found.\n", expected);
@@ -205,6 +314,7 @@ bool has_ext(uint32_t actual_count, VkExtensionProperties *actual_props,
   fprintf(stderr, "Required extension not supported: %s\n", expected);
   return false;
 }
+// TODO improve error handling
 void get_extensions(uint32_t *extension_count, const char ***extension_names) {
   // actual ext of vk
   uint32_t vk_available_extension_count = 0;
@@ -228,9 +338,9 @@ void get_extensions(uint32_t *extension_count, const char ***extension_names) {
     exit(EXIT_FAILURE);
   }
   for (uint32_t i = 0; i < glfw_extension_count; ++i) {
-    if (!has_ext(vk_available_extension_count,
-                 vk_available_extension_properties,
-                 (glfw_extension_names)[i])) {
+    if (!has_extension(vk_available_extension_count,
+                       vk_available_extension_properties,
+                       (glfw_extension_names)[i])) {
       goto ext_not_found;
     }
   }
@@ -239,9 +349,9 @@ void get_extensions(uint32_t *extension_count, const char ***extension_names) {
   int extra_extension_count = 0;
   if (is_validation_enabled) {
     extra_extension_count++;
-    if (!has_ext(vk_available_extension_count,
-                 vk_available_extension_properties,
-                 VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+    if (!has_extension(vk_available_extension_count,
+                       vk_available_extension_properties,
+                       VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
       goto ext_not_found;
     }
   }
@@ -297,7 +407,7 @@ void get_layers(uint32_t *layer_count, const char ***layer_names) {
   vkEnumerateInstanceLayerProperties(&vk_layer_count, vk_layer_properties);
 
   for (int i = 0; i < required_layer_count; i++) {
-    if (!has_layer(*layer_count, vk_layer_properties,
+    if (!has_layer(vk_layer_count, vk_layer_properties,
                    required_layer_names[i])) {
       goto layer_not_found;
     }
