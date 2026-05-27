@@ -35,9 +35,9 @@ void get_layers(uint32_t *layer_count, const char ***layer_properties);
 static int initVulkan(HelloTriangleApplication *app) {
   VkResult result = VK_SUCCESS;
   VkInstance instance = VK_NULL_HANDLE;
+  VkSurfaceKHR surface = VK_NULL_HANDLE;
   VkPhysicalDevice physical_device = VK_NULL_HANDLE;
   VkDevice device = VK_NULL_HANDLE;
-  VkBuffer buffer = VK_NULL_HANDLE;
   VkQueue graphic_queue = VK_NULL_HANDLE;
 
   uint32_t required_layer_count = 0;
@@ -77,11 +77,26 @@ static int initVulkan(HelloTriangleApplication *app) {
 
     printf("vk::Instance created\n");
   }
+  // @surface
+  {
+    result = glfwCreateWindowSurface(instance, app->window, NULL, &surface);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "GLFW error: failed to create a window surface");
+      goto cleanup;
+    }
   }
 
   // @physical device
-  uint32_t graphic_queue_index = UINT32_MAX;
-  VkPhysicalDeviceFeatures2 device_features;
+  uint32_t graphic_queue_index = ~0;
+  VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features =
+      {.sType =
+           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+  VkPhysicalDeviceVulkan13Features vulkan13_features = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+      .pNext = &extended_dynamic_state_features};
+  VkPhysicalDeviceFeatures2 device_features = (VkPhysicalDeviceFeatures2){
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+      .pNext = &vulkan13_features};
   const char *required_device_extension_names[] = {
       VK_KHR_SWAPCHAIN_EXTENSION_NAME};
   const uint32_t required_device_extension_count =
@@ -130,16 +145,23 @@ static int initVulkan(HelloTriangleApplication *app) {
     vkGetPhysicalDeviceQueueFamilyProperties(physical_device,
                                              &physical_device_queue_count,
                                              physical_device_queue_properties);
-    bool supports_graphic_queue = false;
+    VkBool32 supports_surface = false;
     for (uint32_t i = 0; i < physical_device_queue_count; ++i) {
-      printf("%i => %u\n", i, physical_device_queue_properties[i].queueFlags);
+      result = vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, i, surface,
+                                                    &supports_surface);
+      if (result != VK_SUCCESS) {
+        fprintf(stderr, "Vulkan error: unable to test if physical device "
+                        "support vk surface.");
+        continue;
+      }
       if (physical_device_queue_properties[i].queueFlags &
-          VK_QUEUE_GRAPHICS_BIT) {
-        supports_graphic_queue = true;
+              VK_QUEUE_GRAPHICS_BIT &&
+          supports_surface) {
+        graphic_queue_index = i;
         break;
       }
     }
-    if (!supports_graphic_queue) {
+    if (graphic_queue_index == ~0) {
       fprintf(stderr,
               "Vulkan error: physical device does not support graphic queue\n");
       goto cleanup;
@@ -169,15 +191,6 @@ static int initVulkan(HelloTriangleApplication *app) {
     }
 
     // verify dynamic rendering feature
-    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features =
-        {.sType =
-             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
-    VkPhysicalDeviceVulkan13Features vulkan13_features = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        .pNext = &extended_dynamic_state_features};
-    device_features = (VkPhysicalDeviceFeatures2){
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext = &vulkan13_features};
     vkGetPhysicalDeviceFeatures2(physical_device, &device_features);
 
     if (!vulkan13_features.dynamicRendering ||
@@ -192,10 +205,9 @@ static int initVulkan(HelloTriangleApplication *app) {
 
   // @logical device
   {
-    float queue_priority = 1.0f;
+    float queue_priority = 1.f;
     VkDeviceQueueCreateInfo device_queue_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .pNext = &device_features,
         .queueCount = 1,
         .pQueuePriorities = &queue_priority,
         .queueFamilyIndex = graphic_queue_index};
@@ -211,7 +223,6 @@ static int initVulkan(HelloTriangleApplication *app) {
       fprintf(stderr, "Vulkan error: failed to create logical device\n");
       goto cleanup;
     }
-
     vkGetDeviceQueue(device, graphic_queue_index, 0, &graphic_queue);
 
     printf("vk::LogicalDevice (and queue handle) created\n");
@@ -240,6 +251,10 @@ cleanup:
 
   if (device != VK_NULL_HANDLE)
     vkDestroyDevice(device, NULL);
+
+  if (surface != VK_NULL_HANDLE) {
+    vkDestroySurfaceKHR(instance, surface, NULL);
+  }
 
   if (instance != VK_NULL_HANDLE)
     vkDestroyInstance(instance, NULL);
