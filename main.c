@@ -39,6 +39,9 @@ static int initVulkan(HelloTriangleApplication *app) {
   VkPhysicalDevice physical_device = VK_NULL_HANDLE;
   VkDevice device = VK_NULL_HANDLE;
   VkQueue graphic_queue = VK_NULL_HANDLE;
+  VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+  uint32_t swapchain_images_count = 0;
+  VkImage *swapchain_images = VK_NULL_HANDLE;
 
   uint32_t required_layer_count = 0;
   const char **required_layers = NULL;
@@ -228,6 +231,110 @@ static int initVulkan(HelloTriangleApplication *app) {
     printf("vk::LogicalDevice (and queue handle) created\n");
   }
 
+  // @swapchain
+  {
+    VkSurfaceCapabilitiesKHR capabilities;
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
+                                              &capabilities);
+
+    VkExtent2D swap_extent = capabilities.currentExtent;
+    if (swap_extent.width == UINT32_MAX) {
+      int w, h;
+      glfwGetFramebufferSize(app->window, &w, &h);
+      swap_extent = (VkExtent2D){
+          .width = clamp(w, capabilities.minImageExtent.width,
+                         capabilities.maxImageExtent.width),
+          .height = clamp(h, capabilities.minImageExtent.height,
+                          capabilities.maxImageExtent.height),
+      };
+    }
+
+    uint32_t swap_image_count = max(3, capabilities.minImageCount);
+    if (0 < capabilities.maxImageCount &&
+        capabilities.maxImageCount < swap_image_count) {
+      swap_image_count = capabilities.maxImageCount;
+    }
+
+    uint32_t formats_count;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface,
+                                         &formats_count, NULL);
+    if (formats_count == 0) {
+      fprintf(stderr, "Vulkan error: no present mode available\n");
+      goto cleanup;
+    }
+    VkSurfaceFormatKHR *available_formats =
+        malloc(sizeof(VkSurfaceFormatKHR) * formats_count);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface,
+                                         &formats_count, available_formats);
+
+    uint32_t format_index = 0;
+    for (int i = 0; i < formats_count; i++) {
+      if (available_formats[i].format == VK_FORMAT_B8G8R8A8_SRGB &&
+          available_formats[i].colorSpace ==
+              VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        format_index = i;
+        break;
+      }
+    }
+
+    uint32_t present_modes_count;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface,
+                                              &present_modes_count, NULL);
+    if (present_modes_count == 0) {
+      fprintf(stderr, "Vulkan error: no present mode available\n");
+      goto cleanup;
+    }
+    VkPresentModeKHR *available_present_modes =
+        malloc(sizeof(VkPresentModeKHR) * present_modes_count);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface,
+                                              &present_modes_count,
+                                              available_present_modes);
+
+    uint32_t present_mode_index = 0;
+    for (int i = 0; i < present_modes_count; i++) {
+      if (available_present_modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
+        present_mode_index = i;
+        break;
+      }
+      if (available_present_modes[i] == VK_PRESENT_MODE_FIFO_KHR) {
+        present_mode_index = i;
+      }
+    }
+
+    VkSwapchainCreateInfoKHR swapchain_create_info = {
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .surface = surface,
+        .minImageCount = swap_image_count,
+        .imageFormat = available_formats[format_index].format,
+        .imageColorSpace = available_formats[format_index].colorSpace,
+        .imageExtent = swap_extent,
+        .imageArrayLayers = 1,
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .preTransform = capabilities.currentTransform,
+        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .presentMode = available_present_modes[present_mode_index],
+        .clipped = true};
+
+    vkCreateSwapchainKHR(device, &swapchain_create_info, NULL, &swapchain);
+    vkGetSwapchainImagesKHR(device, swapchain, &swapchain_images_count, NULL);
+    swapchain_images = malloc(sizeof(VkImage) * swapchain_images_count);
+    vkGetSwapchainImagesKHR(device, swapchain, &swapchain_images_count,
+                            &swapchain_images);
+
+    free(available_formats);
+    free(available_present_modes);
+    printf("vk::Swapchain created\n");
+  }
+
+  // @image views
+  {
+    if (swapchain_images_count == 0) {
+      fprintf(stderr, "Vulkan error: swapchain is empty\n");
+      goto cleanup;
+    }
+  }
+
   // @buffer
   {
     VkBufferCreateInfo buffer_info = {
@@ -248,6 +355,9 @@ static int initVulkan(HelloTriangleApplication *app) {
 cleanup:
   if (buffer != VK_NULL_HANDLE)
     vkDestroyBuffer(device, buffer, NULL);
+
+  if (swapchain != VK_NULL_HANDLE)
+    vkDestroySwapchainKHR(device, swapchain, NULL);
 
   if (device != VK_NULL_HANDLE)
     vkDestroyDevice(device, NULL);
