@@ -3,9 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <vulkan/vulkan_core.h>
 #define GLFW_INCLUDE_VULKAN
-
 #include <GLFW/glfw3.h>
 
 #include "base.c"
@@ -13,11 +11,12 @@
 #ifdef VK_ENABLE_VALIDATION
 static const bool is_validation_enabled = 1;
 char const *validation_layer_names[] = {"VK_LAYER_KHRONOS_validation"};
-const uint32_t validation_layer_count =
+const u32 validation_layer_count =
     sizeof(validation_layer_names) / sizeof(validation_layer_names[0]);
-
 #else
 static const bool is_validation_enabled = 0;
+char const *validation_layer_names[] = {};
+const u32 validation_layer_count = 0;
 #endif
 
 typedef struct HelloTriangleApplication {
@@ -25,13 +24,16 @@ typedef struct HelloTriangleApplication {
   VkInstance *instance;
 } HelloTriangleApplication;
 
-void get_extensions(uint32_t *extension_count, const char ***extension_names);
-bool has_extension(uint32_t actual_count, VkExtensionProperties *actual_props,
+bool get_extensions(Arena *vulkan_arena, u32 *extension_count,
+                    const char ***extension_names);
+bool has_extension(u32 actual_count, VkExtensionProperties *actual_props,
                    const char *const expected);
-void get_layers(uint32_t *layer_count, const char ***layer_properties);
+bool get_layers(Arena *arena, u32 *layer_count, const char ***layer_properties);
 
 //@ Init
 static int initVulkan(HelloTriangleApplication *app) {
+  Arena *vulkan_arena = arena_create(ARENA_DEFAULT_BLOCK_SIZE);
+  Arena *scratch_arena = arena_create(ARENA_DEFAULT_BLOCK_SIZE);
   VkResult result = VK_SUCCESS;
   VkInstance instance = VK_NULL_HANDLE;
   VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -39,27 +41,35 @@ static int initVulkan(HelloTriangleApplication *app) {
   VkDevice device = VK_NULL_HANDLE;
   VkQueue graphic_queue = VK_NULL_HANDLE;
   VkSwapchainKHR swapchain = VK_NULL_HANDLE;
-  uint32_t swapchain_images_count = 0;
+  u32 swapchain_images_count = 0;
   VkImage *swapchain_images = VK_NULL_HANDLE;
   VkImageView *swapchain_image_views = VK_NULL_HANDLE;
   VkBuffer buffer = VK_NULL_HANDLE;
 
-  const VkApplicationInfo appInfo = {.pApplicationName = "Hello Triangle",
-                                     .applicationVersion =
-                                         VK_MAKE_VERSION(1, 0, 0),
-                                     .pEngineName = "No Engine",
-                                     .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-                                     .apiVersion = VK_API_VERSION_1_4};
-
   // @instance
   {
-    uint32_t extension_count;
+    ArenaTemp scratch = arena_temp_begin(scratch_arena);
+    u32 extension_count;
     const char **extension_names = NULL;
-    get_extensions(&extension_count, &extension_names);
+    if (!get_extensions(scratch_arena, &extension_count, &extension_names)) {
+      fprintf(stderr, "Vulkan error: failed to resolve instance extensions\n");
+      goto cleanup;
+    }
 
-    uint32_t layer_count;
+    u32 layer_count;
     const char **layer_names = NULL;
-    get_layers(&layer_count, &layer_names);
+    if (!get_layers(scratch_arena, &layer_count, &layer_names)) {
+      fprintf(stderr, "Vulkan error: failed to resolve validation layers\n");
+      goto cleanup;
+    }
+    const VkApplicationInfo appInfo = {
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "Hello Triangle",
+        .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
+        .pEngineName = "No Engine",
+        .engineVersion = VK_MAKE_VERSION(1, 0, 0),
+        .apiVersion = VK_API_VERSION_1_3};
+
     const VkInstanceCreateInfo createInfo = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &appInfo,
@@ -77,6 +87,7 @@ static int initVulkan(HelloTriangleApplication *app) {
     }
 
     printf("vk::Instance created\n");
+    arena_temp_end(scratch);
   }
   // @surface
   {
@@ -85,10 +96,11 @@ static int initVulkan(HelloTriangleApplication *app) {
       fprintf(stderr, "GLFW error: failed to create a window surface");
       goto cleanup;
     }
+    printf("vk::Surface created\n");
   }
 
   // @physical device
-  uint32_t graphic_queue_index = UINT32_MAX;
+  u32 graphic_queue_index = UINT32_MAX;
   VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features =
       {.sType =
            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
@@ -100,32 +112,27 @@ static int initVulkan(HelloTriangleApplication *app) {
       .pNext = &vulkan13_features};
   const char *required_device_extension_names[] = {
       VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-  const uint32_t required_device_extension_count =
+  const u32 required_device_extension_count =
       sizeof(required_device_extension_names) /
       sizeof(required_device_extension_names[0]);
   {
-    uint32_t physical_device_count = 0;
+    ArenaTemp scratch = arena_temp_begin(scratch_arena);
+    u32 physical_device_count = 0;
     result = vkEnumeratePhysicalDevices(instance, &physical_device_count, NULL);
     if (result != VK_SUCCESS || physical_device_count == 0) {
       fprintf(stderr, "Vulkan error: no physical device found\n");
       goto cleanup;
     }
-    VkPhysicalDevice *physical_devices =
-        malloc(sizeof(*physical_devices) * physical_device_count);
-    if (physical_devices == NULL) {
-      fprintf(stderr, "Error: out of memory\n");
-      goto cleanup;
-    }
+    VkPhysicalDevice *physical_devices = ARENA_PUSH_ARRAY(
+        scratch_arena, physical_device_count, VkPhysicalDevice);
     result = vkEnumeratePhysicalDevices(instance, &physical_device_count,
                                         physical_devices);
 
     if (result != VK_SUCCESS) {
       fprintf(stderr, "Vulkan error: failed to enumerate physical devices\n");
-      free(physical_devices);
       goto cleanup;
     }
     physical_device = physical_devices[0];
-    free(physical_devices);
 
     // verify 1.3 support
     VkPhysicalDeviceProperties2 physical_device_properties = {
@@ -138,16 +145,17 @@ static int initVulkan(HelloTriangleApplication *app) {
     }
 
     // verify graphic queue
-    uint32_t physical_device_queue_count = 0;
+    u32 physical_device_queue_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(
         physical_device, &physical_device_queue_count, NULL);
     VkQueueFamilyProperties *physical_device_queue_properties =
-        malloc(sizeof(VkQueueFamilyProperties) * physical_device_queue_count);
+        ARENA_PUSH_ARRAY(scratch_arena, physical_device_queue_count,
+                         VkQueueFamilyProperties);
     vkGetPhysicalDeviceQueueFamilyProperties(physical_device,
                                              &physical_device_queue_count,
                                              physical_device_queue_properties);
     VkBool32 supports_surface = false;
-    for (uint32_t i = 0; i < physical_device_queue_count; ++i) {
+    for (u32 i = 0; i < physical_device_queue_count; ++i) {
       result = vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, i, surface,
                                                     &supports_surface);
       if (result != VK_SUCCESS) {
@@ -169,16 +177,16 @@ static int initVulkan(HelloTriangleApplication *app) {
     }
 
     // verify swapchain extension
-    uint32_t extension_count = 0;
+    u32 extension_count = 0;
     vkEnumerateDeviceExtensionProperties(physical_device, NULL,
                                          &extension_count, NULL);
     VkExtensionProperties *extension_properties =
-        malloc(sizeof(VkExtensionProperties) * extension_count);
+        ARENA_PUSH_ARRAY(scratch_arena, extension_count, VkExtensionProperties);
     vkEnumerateDeviceExtensionProperties(
         physical_device, NULL, &extension_count, extension_properties);
 
     bool supports_swapchain = false;
-    for (uint32_t i = 0; i < required_device_extension_count; i++) {
+    for (u32 i = 0; i < required_device_extension_count; i++) {
       if (has_extension(extension_count, extension_properties,
                         required_device_extension_names[i])) {
         supports_swapchain = true;
@@ -202,6 +210,7 @@ static int initVulkan(HelloTriangleApplication *app) {
     }
 
     printf("vk::PhysicalDevice created\n");
+    arena_temp_end(scratch);
   }
 
   // @logical device
@@ -231,6 +240,7 @@ static int initVulkan(HelloTriangleApplication *app) {
 
   // @swapchain
   VkSurfaceFormatKHR swapchain_format;
+  ArenaTemp swapchain_scratch = arena_temp_begin(scratch_arena);
   {
     VkSurfaceCapabilitiesKHR capabilities;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
@@ -241,20 +251,20 @@ static int initVulkan(HelloTriangleApplication *app) {
       int w, h;
       glfwGetFramebufferSize(app->window, &w, &h);
       swap_extent = (VkExtent2D){
-          .width = clamp((uint32_t)w, capabilities.minImageExtent.width,
+          .width = clamp((u32)w, capabilities.minImageExtent.width,
                          capabilities.maxImageExtent.width),
-          .height = clamp((uint32_t)h, capabilities.minImageExtent.height,
+          .height = clamp((u32)h, capabilities.minImageExtent.height,
                           capabilities.maxImageExtent.height),
       };
     }
 
-    uint32_t swap_image_count = max(3, capabilities.minImageCount);
+    u32 swap_image_count = max(3, capabilities.minImageCount);
     if (0 < capabilities.maxImageCount &&
         capabilities.maxImageCount < swap_image_count) {
       swap_image_count = capabilities.maxImageCount;
     }
 
-    uint32_t formats_count;
+    u32 formats_count;
     vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface,
                                          &formats_count, NULL);
     if (formats_count == 0) {
@@ -262,12 +272,12 @@ static int initVulkan(HelloTriangleApplication *app) {
       goto cleanup;
     }
     VkSurfaceFormatKHR *available_formats =
-        malloc(sizeof(VkSurfaceFormatKHR) * formats_count);
+        ARENA_PUSH_ARRAY(scratch_arena, formats_count, VkSurfaceFormatKHR);
     vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface,
                                          &formats_count, available_formats);
 
-    uint32_t format_index = 0;
-    for (uint32_t i = 0; i < formats_count; i++) {
+    u32 format_index = 0;
+    for (u32 i = 0; i < formats_count; i++) {
       if (available_formats[i].format == VK_FORMAT_B8G8R8A8_SRGB &&
           available_formats[i].colorSpace ==
               VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
@@ -277,7 +287,7 @@ static int initVulkan(HelloTriangleApplication *app) {
     }
     swapchain_format = available_formats[format_index];
 
-    uint32_t present_modes_count;
+    u32 present_modes_count;
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface,
                                               &present_modes_count, NULL);
     if (present_modes_count == 0) {
@@ -285,13 +295,13 @@ static int initVulkan(HelloTriangleApplication *app) {
       goto cleanup;
     }
     VkPresentModeKHR *available_present_modes =
-        malloc(sizeof(VkPresentModeKHR) * present_modes_count);
+        ARENA_PUSH_ARRAY(scratch_arena, present_modes_count, VkPresentModeKHR);
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface,
                                               &present_modes_count,
                                               available_present_modes);
 
-    uint32_t present_mode_index = 0;
-    for (uint32_t i = 0; i < present_modes_count; i++) {
+    u32 present_mode_index = 0;
+    for (u32 i = 0; i < present_modes_count; i++) {
       if (available_present_modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
         present_mode_index = i;
         break;
@@ -318,12 +328,11 @@ static int initVulkan(HelloTriangleApplication *app) {
 
     vkCreateSwapchainKHR(device, &swapchain_create_info, NULL, &swapchain);
     vkGetSwapchainImagesKHR(device, swapchain, &swapchain_images_count, NULL);
-    swapchain_images = malloc(sizeof(VkImage) * swapchain_images_count);
+    swapchain_images =
+        ARENA_PUSH_ARRAY(scratch_arena, swapchain_images_count, VkImage);
     vkGetSwapchainImagesKHR(device, swapchain, &swapchain_images_count,
                             swapchain_images);
 
-    free(available_formats);
-    free(available_present_modes);
     printf("vk::Swapchain (and images) created\n");
   }
 
@@ -335,7 +344,7 @@ static int initVulkan(HelloTriangleApplication *app) {
     }
 
     swapchain_image_views =
-        malloc(sizeof(VkImageView) * swapchain_images_count);
+        ARENA_PUSH_ARRAY(vulkan_arena, swapchain_images_count, VkImageView);
     VkImageViewCreateInfo image_view_create_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
@@ -356,7 +365,7 @@ static int initVulkan(HelloTriangleApplication *app) {
             .a = VK_COMPONENT_SWIZZLE_A,
         }};
 
-    for (uint32_t i = 0; i < swapchain_images_count; i++) {
+    for (u32 i = 0; i < swapchain_images_count; i++) {
       image_view_create_info.image = swapchain_images[i];
       result = vkCreateImageView(device, &image_view_create_info, NULL,
                                  &swapchain_image_views[i]);
@@ -371,6 +380,7 @@ static int initVulkan(HelloTriangleApplication *app) {
 
     printf("vk::ImageView (for swapchain) created\n");
   }
+  arena_temp_end(swapchain_scratch);
 
   // @buffer
   {
@@ -387,6 +397,10 @@ static int initVulkan(HelloTriangleApplication *app) {
     printf("vk::Buffer created\n");
   }
 
+  // arena_destroy(vulkan_arena);
+  arena_destroy(scratch_arena);
+  exit(-1);
+
   return 0;
 
 cleanup:
@@ -394,17 +408,8 @@ cleanup:
     vkDestroyBuffer(device, buffer, NULL);
 
   if (swapchain_image_views != VK_NULL_HANDLE) {
-    for (uint32_t i = 0; i < swapchain_images_count; i++)
+    for (u32 i = 0; i < swapchain_images_count; i++)
       vkDestroyImageView(device, swapchain_image_views[i], NULL);
-
-    free(swapchain_image_views);
-  }
-
-  if (swapchain_images != VK_NULL_HANDLE) {
-    for (uint32_t i = 0; i < swapchain_images_count; i++)
-      vkDestroyImage(device, swapchain_images[i], NULL);
-
-    free(swapchain_images);
   }
 
   if (swapchain != VK_NULL_HANDLE)
@@ -420,6 +425,8 @@ cleanup:
   if (instance != VK_NULL_HANDLE)
     vkDestroyInstance(instance, NULL);
 
+  arena_destroy(vulkan_arena);
+  arena_destroy(scratch_arena);
   return -1;
 }
 
@@ -477,9 +484,9 @@ int main(void) {
   return EXIT_SUCCESS;
 }
 
-bool has_extension(uint32_t actual_count, VkExtensionProperties *actual_props,
+bool has_extension(u32 actual_count, VkExtensionProperties *actual_props,
                    const char *const expected) {
-  for (uint32_t j = 0; j < actual_count; ++j) {
+  for (u32 j = 0; j < actual_count; ++j) {
     if (strcmp(expected, actual_props[j].extensionName) == 0) {
       printf("extension %s found.\n", expected);
       return true;
@@ -489,33 +496,31 @@ bool has_extension(uint32_t actual_count, VkExtensionProperties *actual_props,
   return false;
 }
 // TODO improve error handling
-void get_extensions(uint32_t *extension_count, const char ***extension_names) {
+bool get_extensions(Arena *arena, u32 *extension_count,
+                    const char ***extension_names) {
   // actual ext of vk
-  uint32_t vk_available_extension_count = 0;
+  u32 vk_available_extension_count = 0;
+
   vkEnumerateInstanceExtensionProperties(NULL, &vk_available_extension_count,
                                          NULL);
-  VkExtensionProperties *vk_available_extension_properties =
-      malloc(sizeof(VkExtensionProperties) * vk_available_extension_count);
-  if (vk_available_extension_properties == NULL) {
-    fprintf(stderr, "Out of memory\n");
-    exit(EXIT_FAILURE);
-  }
+  VkExtensionProperties *vk_available_extension_properties = ARENA_PUSH_ARRAY(
+      arena, vk_available_extension_count, VkExtensionProperties);
   vkEnumerateInstanceExtensionProperties(NULL, &vk_available_extension_count,
                                          vk_available_extension_properties);
 
   // expected ext by glfw
-  uint32_t glfw_extension_count = 0; // TODO change
+  u32 glfw_extension_count = 0; // TODO change
   const char **glfw_extension_names =
       glfwGetRequiredInstanceExtensions(&glfw_extension_count);
   if (glfw_extension_names == NULL) {
     fprintf(stderr, "Failed to get GLFW required extensions\n");
-    exit(EXIT_FAILURE);
+    return false;
   }
-  for (uint32_t i = 0; i < glfw_extension_count; ++i) {
+  for (u32 i = 0; i < glfw_extension_count; ++i) {
     if (!has_extension(vk_available_extension_count,
                        vk_available_extension_properties,
                        (glfw_extension_names)[i])) {
-      goto ext_not_found;
+      return false;
     }
   }
 
@@ -526,30 +531,25 @@ void get_extensions(uint32_t *extension_count, const char ***extension_names) {
     if (!has_extension(vk_available_extension_count,
                        vk_available_extension_properties,
                        VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
-      goto ext_not_found;
+      return false;
     }
   }
 
-  *extension_count = glfw_extension_count + (uint32_t)extra_extension_count;
-  *extension_names = malloc(sizeof(**extension_names) * *extension_count);
+  *extension_count = glfw_extension_count + (u32)extra_extension_count;
+  *extension_names = ARENA_PUSH_ARRAY(arena, *extension_count, const char *);
   memcpy(*extension_names, glfw_extension_names,
          sizeof(*glfw_extension_names) * glfw_extension_count);
-  (*extension_names)[glfw_extension_count] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-
-  return;
-
-// TODO: add portability
-ext_not_found:
-  if (vk_available_extension_properties) {
-    free(vk_available_extension_properties);
+  if (is_validation_enabled) {
+    (*extension_names)[glfw_extension_count] =
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
   }
 
-  exit(EXIT_FAILURE);
+  return true;
 }
 
-bool has_layer(uint32_t actual_count, VkLayerProperties *actual_props,
+bool has_layer(u32 actual_count, VkLayerProperties *actual_props,
                const char *const expected) {
-  for (uint32_t i = 0; i < actual_count; i++) {
+  for (u32 i = 0; i < actual_count; i++) {
     if (strcmp(actual_props[i].layerName, expected) == 0) {
       printf("layer %s found.\n", expected);
       return true;
@@ -558,42 +558,32 @@ bool has_layer(uint32_t actual_count, VkLayerProperties *actual_props,
   fprintf(stderr, "Required layer do not exist: %s\n", expected);
   return false;
 }
-void get_layers(uint32_t *layer_count, const char ***layer_names) {
-  uint32_t required_layer_count = 0;
+bool get_layers(Arena *arena, u32 *layer_count, const char ***layer_names) {
+  u32 required_layer_count = 0;
   const char **required_layer_names = NULL;
   if (is_validation_enabled) {
     required_layer_count = validation_layer_count;
     required_layer_names =
-        malloc(sizeof(*required_layer_names) * required_layer_count);
+        ARENA_PUSH_ARRAY(arena, required_layer_count, const char *);
 
     memcpy(required_layer_names, validation_layer_names,
            sizeof(validation_layer_names) * validation_layer_count);
   }
 
-  uint32_t vk_layer_count;
+  u32 vk_layer_count;
   vkEnumerateInstanceLayerProperties(&vk_layer_count, NULL);
   VkLayerProperties *vk_layer_properties =
-      malloc(sizeof(VkLayerProperties) * vk_layer_count);
-  if (vk_layer_properties == NULL) {
-    fprintf(stderr, "Out of memory\n");
-    exit(EXIT_FAILURE);
-  }
+      ARENA_PUSH_ARRAY(arena, vk_layer_count, VkLayerProperties);
   vkEnumerateInstanceLayerProperties(&vk_layer_count, vk_layer_properties);
 
-  for (uint32_t i = 0; i < required_layer_count; i++) {
+  for (u32 i = 0; i < required_layer_count; i++) {
     if (!has_layer(vk_layer_count, vk_layer_properties,
                    required_layer_names[i])) {
-      goto layer_not_found;
+      return false;
     }
   }
   *layer_count = required_layer_count;
   *layer_names = required_layer_names;
 
-  return;
-
-layer_not_found:
-  if (vk_layer_properties) {
-    free(vk_layer_properties);
-  }
-  exit(EXIT_FAILURE);
+  return true;
 }

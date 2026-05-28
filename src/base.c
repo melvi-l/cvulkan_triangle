@@ -43,6 +43,14 @@ typedef double f64;
 
 #define LOG(fmt, ...) printf("[" LOG_MODULE "] " fmt "\n", ##__VA_ARGS__)
 
+#define TIME_BLOCK(label, expr)                                                \
+  do {                                                                         \
+    double _t = glfwGetTime();                                                 \
+    expr;                                                                      \
+    printf("%s: %.3f ms\n", label, (glfwGetTime() - _t) * 1000.0);             \
+  } while (0)
+
+
 // @arena
 #define ARENA_DEFAULT_BLOCK_SIZE KiB(4)
 #define ARENA_DEFAULT_ALIGNMENT 8
