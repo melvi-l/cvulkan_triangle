@@ -110,7 +110,7 @@ void arena_destroy(Arena *arena) {
   }
 
   free(arena);
-};
+}
 
 void *arena_alloc(Arena *arena, size_t size) {
   if (!arena) {
@@ -154,7 +154,7 @@ void *arena_alloc(Arena *arena, size_t size) {
   new_block->used += size;
   arena->total_used += size;
   return ptr;
-};
+}
 
 void *arena_alloc_zero(Arena *arena, size_t count, size_t size) {
   size_t total = count * size;
@@ -163,7 +163,7 @@ void *arena_alloc_zero(Arena *arena, size_t count, size_t size) {
     memset(ptr, 0, total);
   }
   return ptr;
-};
+}
 
 // Reset arena for reuse (keeps memory)
 void arena_reset(Arena *arena) {
@@ -228,7 +228,7 @@ void arena_temp_end(ArenaTemp temp) {
   a->total_used -= (temp.saved_block->used - temp.saved_used);
   temp.saved_block->used = temp.saved_used;
   a->current = temp.saved_block;
-};
+}
 
 static inline bool arena_try_stitch(Arena *arena, void *ptr, u64 size,
                                     u64 grow) {
@@ -265,7 +265,7 @@ static inline Str S(const char *cstr) {
   return (Str){(u8 *)cstr, (u64)strlen(cstr)};
 }
 static inline Str S_line(const char *cstr) {
-  int len = strlen(cstr);
+  i32 len = (i32)strlen(cstr);
   if (cstr[len - 1] == '\n') {
     len--;
   }
@@ -283,23 +283,23 @@ static inline Str S_line(const char *cstr) {
 static inline Str str_from(Str base, i32 start) {
   if (start < 0)
     start = 0;
-  if (start > base.length)
-    start = base.length;
-  return (Str){base.value + start, base.length - start};
+  if (start > (i32)base.length)
+    start = (i32)base.length;
+  return (Str){base.value + start, base.length - (u64)start};
 }
 
 static inline Str str_from_to(Str base, i32 start, i32 end) {
   if (start < 0)
     start = 0;
-  if (start > base.length)
-    start = base.length;
+  if (start > (i32)base.length)
+    start = (i32)base.length;
 
   if (end < 0)
-    end = base.length + end;
+    end = (i32)(base.length + (u64)end);
   if (end < 0)
     end = 0;
-  if (end > base.length)
-    end = base.length;
+  if (end > (i32)base.length)
+    end = (i32)base.length;
 
   if (end < start)
     end = start;
@@ -307,7 +307,7 @@ static inline Str str_from_to(Str base, i32 start, i32 end) {
   return (Str){base.value + start, (u64)(end - start)};
 }
 
-static Str str_copy(Arena *arena, const char *cstr) {
+__attribute__((unused)) static Str str_copy(Arena *arena, const char *cstr) {
   assert(arena);
 
   u64 len = (u64)strlen(cstr);
@@ -317,7 +317,7 @@ static Str str_copy(Arena *arena, const char *cstr) {
   return (Str){dst, len};
 }
 
-static Str str_copy_str(Arena *arena, Str s) {
+__attribute__((unused)) static Str str_copy_str(Arena *arena, Str s) {
   assert(arena);
 
   u8 *dst = ARENA_PUSH_ARRAY(arena, s.length, u8);
@@ -326,7 +326,8 @@ static Str str_copy_str(Arena *arena, Str s) {
   return (Str){dst, s.length};
 }
 
-static Str str_format(Arena *arena, const char *fmt, ...) {
+__attribute__((unused)) static Str str_format(Arena *arena, const char *fmt,
+                                              ...) {
   va_list ap;
 
   va_start(ap, fmt);
@@ -338,10 +339,10 @@ static Str str_format(Arena *arena, const char *fmt, ...) {
     abort();
   }
 
-  u8 *cstr = ARENA_PUSH_ARRAY(arena, needed, u8);
+  u8 *cstr = ARENA_PUSH_ARRAY(arena, (size_t)needed, u8);
 
   va_start(ap, fmt);
-  int written = vsnprintf((char *)cstr, needed, fmt, ap);
+  int written = vsnprintf((char *)cstr, (size_t)needed, fmt, ap);
   va_end(ap);
 
   if (written != needed) {
@@ -354,7 +355,7 @@ static Str str_format(Arena *arena, const char *fmt, ...) {
 
 static inline bool str_cmp(Str a, Str b) {
   return ((a.length == b.length) && memcmp(a.value, b.value, a.length) == 0);
-};
+}
 
 static inline bool str_cmp_cstr(Str a, const char *b) {
   return str_cmp(a, S(b));
@@ -493,8 +494,8 @@ static inline u64 str_deserialized_str(Arena *arena, Str string, u64 off,
 }
 
 // @ring
-static inline u64 read_ring(void *ring, u64 ring_position, u64 ring_size,
-                            void *data, u64 size) {
+static inline u64 read_ring(u8 *ring, u64 ring_position, u64 ring_size,
+                            u8 *data, u64 size) {
   u64 ring_offset = ring_position % ring_size;
   u64 count_before_split = min(size, ring_size - ring_offset);
   u64 count_after_split = size - count_before_split;
@@ -504,8 +505,8 @@ static inline u64 read_ring(void *ring, u64 ring_position, u64 ring_size,
 }
 #define read_ring_struct(ring, ring_position, ring_size, ptr)                  \
   read_ring(ring, ring_position, ring_size, ptr, sizeof(ptr))
-static inline u64 write_ring(void *ring, u64 ring_position, u64 ring_size,
-                             void *data, u64 size) {
+static inline u64 write_ring(u8 *ring, u64 ring_position, u64 ring_size,
+                             u8 *data, u64 size) {
   assert(size <= ring_size);
   u64 ring_offset = ring_position % ring_size;
   u64 count_before_split = min(size, ring_size - ring_offset);

@@ -10,11 +10,10 @@
 
 #include "base.c"
 
-#define VK_ENABLE_VALIDATION
 #ifdef VK_ENABLE_VALIDATION
 static const bool is_validation_enabled = 1;
 char const *validation_layer_names[] = {"VK_LAYER_KHRONOS_validation"};
-const int validation_layer_count =
+const uint32_t validation_layer_count =
     sizeof(validation_layer_names) / sizeof(validation_layer_names[0]);
 
 #else
@@ -43,9 +42,7 @@ static int initVulkan(HelloTriangleApplication *app) {
   uint32_t swapchain_images_count = 0;
   VkImage *swapchain_images = VK_NULL_HANDLE;
   VkImageView *swapchain_image_views = VK_NULL_HANDLE;
-
-  uint32_t required_layer_count = 0;
-  const char **required_layers = NULL;
+  VkBuffer buffer = VK_NULL_HANDLE;
 
   const VkApplicationInfo appInfo = {.pApplicationName = "Hello Triangle",
                                      .applicationVersion =
@@ -91,7 +88,7 @@ static int initVulkan(HelloTriangleApplication *app) {
   }
 
   // @physical device
-  uint32_t graphic_queue_index = ~0;
+  uint32_t graphic_queue_index = UINT32_MAX;
   VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features =
       {.sType =
            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
@@ -165,7 +162,7 @@ static int initVulkan(HelloTriangleApplication *app) {
         break;
       }
     }
-    if (graphic_queue_index == ~0) {
+    if (graphic_queue_index == UINT32_MAX) {
       fprintf(stderr,
               "Vulkan error: physical device does not support graphic queue\n");
       goto cleanup;
@@ -181,7 +178,7 @@ static int initVulkan(HelloTriangleApplication *app) {
         physical_device, NULL, &extension_count, extension_properties);
 
     bool supports_swapchain = false;
-    for (int i = 0; i < required_device_extension_count; i++) {
+    for (uint32_t i = 0; i < required_device_extension_count; i++) {
       if (has_extension(extension_count, extension_properties,
                         required_device_extension_names[i])) {
         supports_swapchain = true;
@@ -244,9 +241,9 @@ static int initVulkan(HelloTriangleApplication *app) {
       int w, h;
       glfwGetFramebufferSize(app->window, &w, &h);
       swap_extent = (VkExtent2D){
-          .width = clamp(w, capabilities.minImageExtent.width,
+          .width = clamp((uint32_t)w, capabilities.minImageExtent.width,
                          capabilities.maxImageExtent.width),
-          .height = clamp(h, capabilities.minImageExtent.height,
+          .height = clamp((uint32_t)h, capabilities.minImageExtent.height,
                           capabilities.maxImageExtent.height),
       };
     }
@@ -270,7 +267,7 @@ static int initVulkan(HelloTriangleApplication *app) {
                                          &formats_count, available_formats);
 
     uint32_t format_index = 0;
-    for (int i = 0; i < formats_count; i++) {
+    for (uint32_t i = 0; i < formats_count; i++) {
       if (available_formats[i].format == VK_FORMAT_B8G8R8A8_SRGB &&
           available_formats[i].colorSpace ==
               VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
@@ -294,7 +291,7 @@ static int initVulkan(HelloTriangleApplication *app) {
                                               available_present_modes);
 
     uint32_t present_mode_index = 0;
-    for (int i = 0; i < present_modes_count; i++) {
+    for (uint32_t i = 0; i < present_modes_count; i++) {
       if (available_present_modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
         present_mode_index = i;
         break;
@@ -359,7 +356,7 @@ static int initVulkan(HelloTriangleApplication *app) {
             .a = VK_COMPONENT_SWIZZLE_A,
         }};
 
-    for (int i = 0; i < swapchain_images_count; i++) {
+    for (uint32_t i = 0; i < swapchain_images_count; i++) {
       image_view_create_info.image = swapchain_images[i];
       result = vkCreateImageView(device, &image_view_create_info, NULL,
                                  &swapchain_image_views[i]);
@@ -397,14 +394,14 @@ cleanup:
     vkDestroyBuffer(device, buffer, NULL);
 
   if (swapchain_image_views != VK_NULL_HANDLE) {
-    for (int i = 0; i < swapchain_images_count; i++)
+    for (uint32_t i = 0; i < swapchain_images_count; i++)
       vkDestroyImageView(device, swapchain_image_views[i], NULL);
 
     free(swapchain_image_views);
   }
 
   if (swapchain_images != VK_NULL_HANDLE) {
-    for (int i = 0; i < swapchain_images_count; i++)
+    for (uint32_t i = 0; i < swapchain_images_count; i++)
       vkDestroyImage(device, swapchain_images[i], NULL);
 
     free(swapchain_images);
@@ -464,8 +461,6 @@ static void mainLoop(HelloTriangleApplication *app) {
     glfwPollEvents();
   }
 }
-
-static int run(HelloTriangleApplication *app) { return 0; }
 
 int main(void) {
   HelloTriangleApplication app = {0};
@@ -535,7 +530,7 @@ void get_extensions(uint32_t *extension_count, const char ***extension_names) {
     }
   }
 
-  *extension_count = glfw_extension_count + extra_extension_count;
+  *extension_count = glfw_extension_count + (uint32_t)extra_extension_count;
   *extension_names = malloc(sizeof(**extension_names) * *extension_count);
   memcpy(*extension_names, glfw_extension_names,
          sizeof(*glfw_extension_names) * glfw_extension_count);
@@ -554,7 +549,7 @@ ext_not_found:
 
 bool has_layer(uint32_t actual_count, VkLayerProperties *actual_props,
                const char *const expected) {
-  for (int i = 0; i < actual_count; i++) {
+  for (uint32_t i = 0; i < actual_count; i++) {
     if (strcmp(actual_props[i].layerName, expected) == 0) {
       printf("layer %s found.\n", expected);
       return true;
@@ -585,7 +580,7 @@ void get_layers(uint32_t *layer_count, const char ***layer_names) {
   }
   vkEnumerateInstanceLayerProperties(&vk_layer_count, vk_layer_properties);
 
-  for (int i = 0; i < required_layer_count; i++) {
+  for (uint32_t i = 0; i < required_layer_count; i++) {
     if (!has_layer(vk_layer_count, vk_layer_properties,
                    required_layer_names[i])) {
       goto layer_not_found;
