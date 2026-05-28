@@ -42,6 +42,7 @@ static int initVulkan(HelloTriangleApplication *app) {
   VkSwapchainKHR swapchain = VK_NULL_HANDLE;
   uint32_t swapchain_images_count = 0;
   VkImage *swapchain_images = VK_NULL_HANDLE;
+  VkImageView *swapchain_image_views = VK_NULL_HANDLE;
 
   uint32_t required_layer_count = 0;
   const char **required_layers = NULL;
@@ -232,6 +233,7 @@ static int initVulkan(HelloTriangleApplication *app) {
   }
 
   // @swapchain
+  VkSurfaceFormatKHR swapchain_format;
   {
     VkSurfaceCapabilitiesKHR capabilities;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
@@ -276,6 +278,7 @@ static int initVulkan(HelloTriangleApplication *app) {
         break;
       }
     }
+    swapchain_format = available_formats[format_index];
 
     uint32_t present_modes_count;
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface,
@@ -305,8 +308,8 @@ static int initVulkan(HelloTriangleApplication *app) {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = surface,
         .minImageCount = swap_image_count,
-        .imageFormat = available_formats[format_index].format,
-        .imageColorSpace = available_formats[format_index].colorSpace,
+        .imageFormat = swapchain_format.format,
+        .imageColorSpace = swapchain_format.colorSpace,
         .imageExtent = swap_extent,
         .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
@@ -320,11 +323,11 @@ static int initVulkan(HelloTriangleApplication *app) {
     vkGetSwapchainImagesKHR(device, swapchain, &swapchain_images_count, NULL);
     swapchain_images = malloc(sizeof(VkImage) * swapchain_images_count);
     vkGetSwapchainImagesKHR(device, swapchain, &swapchain_images_count,
-                            &swapchain_images);
+                            swapchain_images);
 
     free(available_formats);
     free(available_present_modes);
-    printf("vk::Swapchain created\n");
+    printf("vk::Swapchain (and images) created\n");
   }
 
   // @image views
@@ -333,6 +336,43 @@ static int initVulkan(HelloTriangleApplication *app) {
       fprintf(stderr, "Vulkan error: swapchain is empty\n");
       goto cleanup;
     }
+
+    swapchain_image_views =
+        malloc(sizeof(VkImageView) * swapchain_images_count);
+    VkImageViewCreateInfo image_view_create_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = swapchain_format.format,
+        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                             .baseMipLevel =
+                                 0, // only mip 0 => image view for swapchain
+                             .levelCount = 1,
+                             .baseArrayLayer =
+                                 0, // only layer 0 => texture 2D normal (not
+                                    // cubemap or multiviewVR)
+                             .layerCount = 1},
+        // TODO experiment with swizzle
+        .components = {
+            .r = VK_COMPONENT_SWIZZLE_R,
+            .g = VK_COMPONENT_SWIZZLE_G,
+            .b = VK_COMPONENT_SWIZZLE_B,
+            .a = VK_COMPONENT_SWIZZLE_A,
+        }};
+
+    for (int i = 0; i < swapchain_images_count; i++) {
+      image_view_create_info.image = swapchain_images[i];
+      result = vkCreateImageView(device, &image_view_create_info, NULL,
+                                 &swapchain_image_views[i]);
+      if (result != VK_SUCCESS) {
+        fprintf(
+            stderr,
+            "Vulkan error: failed to created image view for swapchain image %u",
+            i);
+        goto cleanup;
+      }
+    }
+
+    printf("vk::ImageView (for swapchain) created\n");
   }
 
   // @buffer
@@ -355,6 +395,20 @@ static int initVulkan(HelloTriangleApplication *app) {
 cleanup:
   if (buffer != VK_NULL_HANDLE)
     vkDestroyBuffer(device, buffer, NULL);
+
+  if (swapchain_image_views != VK_NULL_HANDLE) {
+    for (int i = 0; i < swapchain_images_count; i++)
+      vkDestroyImageView(device, swapchain_image_views[i], NULL);
+
+    free(swapchain_image_views);
+  }
+
+  if (swapchain_images != VK_NULL_HANDLE) {
+    for (int i = 0; i < swapchain_images_count; i++)
+      vkDestroyImage(device, swapchain_images[i], NULL);
+
+    free(swapchain_images);
+  }
 
   if (swapchain != VK_NULL_HANDLE)
     vkDestroySwapchainKHR(device, swapchain, NULL);
