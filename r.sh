@@ -7,7 +7,6 @@ BUILD_DIR="./build"
 EXEC="app"
 MODE="${1:-debug}"
 
-COMMON_FLAGS="-Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion"
 COMMON_LIBS="-lglfw -lvulkan"
 
 mkdir -p "$BUILD_DIR"
@@ -19,15 +18,15 @@ slangc "$SRC_DIR/shaders/shader.slang" -target spirv -profile spirv_1_4 \
 
 case "$MODE" in
   debug)
-    CFLAGS="-g3 -O0 $COMMON_FLAGS -DDEBUG -DVK_ENABLE_VALIDATION"
+    CFLAGS="-g3 -O0 -Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion -DDEBUG -DVK_ENABLE_VALIDATION "
     RUN_SANITIZED=0
     ;;
   debug-sanitize)
-    CFLAGS="-g3 -O0 $COMMON_FLAGS -fanalyzer -fsanitize=address,undefined -fno-omit-frame-pointer -DDEBUG -DVK_ENABLE_VALIDATION"
+    CFLAGS="-g3 -O0 -Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion -fanalyzer -fsanitize=address,undefined -fno-omit-frame-pointer -DDEBUG -DVK_ENABLE_VALIDATION"
     RUN_SANITIZED=1
     ;;
   release)
-    CFLAGS="-O2 -DNDEBUG $COMMON_FLAGS"
+    CFLAGS="-O2 -DNDEBUG"
     RUN_SANITIZED=0
     ;;
   *)

@@ -30,6 +30,8 @@ bool has_extension(u32 actual_count, VkExtensionProperties *actual_props,
                    const char *const expected);
 bool get_layers(Arena *arena, u32 *layer_count, const char ***layer_properties);
 
+bool read_shader_file(Arena *arena, const char *path, Str *out);
+
 //@ Init
 static int initVulkan(HelloTriangleApplication *app) {
   Arena *vulkan_arena = arena_create(ARENA_DEFAULT_BLOCK_SIZE);
@@ -44,6 +46,7 @@ static int initVulkan(HelloTriangleApplication *app) {
   u32 swapchain_images_count = 0;
   VkImage *swapchain_images = VK_NULL_HANDLE;
   VkImageView *swapchain_image_views = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
   VkBuffer buffer = VK_NULL_HANDLE;
 
   // @instance
@@ -241,12 +244,13 @@ static int initVulkan(HelloTriangleApplication *app) {
   // @swapchain
   VkSurfaceFormatKHR swapchain_format;
   ArenaTemp swapchain_scratch = arena_temp_begin(scratch_arena);
+  VkExtent2D swap_extent;
   {
     VkSurfaceCapabilitiesKHR capabilities;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
                                               &capabilities);
+    swap_extent = capabilities.currentExtent;
 
-    VkExtent2D swap_extent = capabilities.currentExtent;
     if (swap_extent.width == UINT32_MAX) {
       int w, h;
       glfwGetFramebufferSize(app->window, &w, &h);
@@ -370,10 +374,10 @@ static int initVulkan(HelloTriangleApplication *app) {
       result = vkCreateImageView(device, &image_view_create_info, NULL,
                                  &swapchain_image_views[i]);
       if (result != VK_SUCCESS) {
-        fprintf(
-            stderr,
-            "Vulkan error: failed to created image view for swapchain image %u",
-            i);
+        fprintf(stderr,
+                "Vulkan error: failed to created image view for swapchain "
+                "image %u",
+                i);
         goto cleanup;
       }
     }
@@ -382,24 +386,129 @@ static int initVulkan(HelloTriangleApplication *app) {
   }
   arena_temp_end(swapchain_scratch);
 
-  // @buffer
+  // @render pipeline
+  VkPipelineShaderStageCreateInfo shader_stage_infos[2];
   {
-    VkBufferCreateInfo buffer_info = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = 1024,
-        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    result = vkCreateBuffer(device, &buffer_info, NULL, &buffer);
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: failed to create buffer\n");
-      goto cleanup;
-    }
-    printf("vk::Buffer created\n");
-  }
+    ArenaTemp scratch = arena_temp_begin(scratch_arena);
 
-  // arena_destroy(vulkan_arena);
-  arena_destroy(scratch_arena);
-  exit(-1);
+    Str shader_code = {0};
+    read_shader_file(scratch_arena, "./build/shaders/slang.spv", &shader_code);
+    str_print_hex(&shader_code);
+
+    VkShaderModule shader_module;
+    VkShaderModuleCreateInfo createInfo = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = shader_code.length,
+        .pCode = (const u32 *)shader_code.value};
+    result = vkCreateShaderModule(device, &createInfo, NULL, &shader_module);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: Failed to create shader module\n");
+      return false;
+    }
+
+    VkPipelineShaderStageCreateInfo vertex_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+        .module = shader_module,
+        .pName = "vertMain"};
+    VkPipelineShaderStageCreateInfo fragment_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .module = shader_module,
+        .pName = "fragMain"};
+
+    shader_stage_infos[0] = vertex_stage_info;
+    shader_stage_infos[1] = fragment_stage_info;
+    printf("%p\n", (void *)shader_stage_infos);
+
+    VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                       VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 2,
+        .pDynamicStates = dynamic_states};
+
+    VkPipelineVertexInputStateCreateInfo vertex_input_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+    };
+    VkPipelineInputAssemblyStateCreateInfo input_assembly_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+
+    VkViewport viewport = {.x = 0.0f,
+                           .y = 0.0f,
+                           .width = (float)swap_extent.width,
+                           .height = (float)swap_extent.height,
+                           .minDepth = 0.0f,
+                           .maxDepth = 1.0f};
+    VkRect2D scissor = {.offset = (VkOffset2D){0, 0}, .extent = swap_extent};
+    VkPipelineViewportStateCreateInfo viewport_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .pViewports = &viewport,
+        .scissorCount = 1,
+        .pScissors = &scissor};
+
+    VkPipelineRasterizationStateCreateInfo raterizer = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .depthClampEnable = false,
+        .rasterizerDiscardEnable = false,
+        .polygonMode = VK_POLYGON_MODE_FILL, // TODO test all the MODE
+        .cullMode = VK_CULL_MODE_BACK_BIT,
+        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+        .depthBiasEnable = false,
+        .lineWidth = 1.0f};
+
+    VkPipelineMultisampleStateCreateInfo multisampling = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+        .sampleShadingEnable = false};
+
+    VkPipelineColorBlendAttachmentState color_blend_attachment = {
+        .blendEnable = false,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+    VkPipelineColorBlendStateCreateInfo color_blend_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .logicOpEnable = false,
+        .logicOp = VK_LOGIC_OP_COPY,
+        .attachmentCount = 1,
+        .pAttachments = &color_blend_attachment};
+
+    VkPipelineLayout pipeline_layout = NULL;
+    VkPipelineLayoutCreateInfo pipeline_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 0,
+        .pushConstantRangeCount = 0};
+    result = vkCreatePipelineLayout(device, &pipeline_layout_info, NULL,
+                                    &pipeline_layout);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: Failed to create pipeline layout\n");
+      return false;
+    }
+    VkPipelineRenderingCreateInfo pipeline_rendering_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &swapchain_format.format};
+    VkGraphicsPipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2,
+        .pStages = shader_stage_infos,
+        .pVertexInputState = &vertex_input_info,
+        .pInputAssemblyState = &input_assembly_info,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &raterizer,
+        .pMultisampleState = &multisampling,
+        .pColorBlendState = &color_blend_info,
+        .pDynamicState = &dynamic_state,
+        .layout = pipeline_layout,
+        .renderPass = NULL,
+        .pNext = &pipeline_rendering_info};
+
+    result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                       &pipeline_info, NULL, &pipeline);
+    arena_temp_end(scratch);
+  }
 
   return 0;
 
@@ -584,6 +693,52 @@ bool get_layers(Arena *arena, u32 *layer_count, const char ***layer_names) {
   }
   *layer_count = required_layer_count;
   *layer_names = required_layer_names;
+
+  return true;
+}
+
+bool read_shader_file(Arena *arena, const char *path, Str *out) {
+  FILE *file = fopen(path, "rb");
+
+  if (file == NULL) {
+    fprintf(stderr, "Failed to open shader file %s\n", path);
+    return false;
+  }
+
+  if (fseek(file, 0, SEEK_END) != 0) {
+    fprintf(stderr, "Failed to seek shader file %s\n", path);
+    fclose(file);
+    return false;
+  }
+
+  long file_size = ftell(file);
+
+  if (file_size < 0) {
+    fprintf(stderr, "Failed to get shader file size: %s\n", path);
+    fclose(file);
+    return false;
+  }
+
+  rewind(file);
+
+  u8 *buffer = ARENA_PUSH_ARRAY(arena, (size_t)file_size, u8);
+
+  size_t read_size = fread(buffer, 1, (size_t)file_size, file);
+
+  fclose(file);
+
+  if (read_size != (size_t)file_size) {
+    fprintf(stderr, "Failed to read shader file: %s\n", path);
+    return false;
+  }
+
+  if (file_size % 4 != 0) {
+    fprintf(stderr, "Shader byte code is not multiple of 4\n");
+    return false;
+  }
+
+  out->length = (u64)file_size;
+  out->value = buffer;
 
   return true;
 }
