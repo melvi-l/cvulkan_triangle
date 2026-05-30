@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vulkan/vulkan_core.h>
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -21,8 +22,35 @@ const u32 validation_layer_count = 0;
 
 typedef struct HelloTriangleApplication {
   GLFWwindow *window;
-  VkInstance *instance;
-} HelloTriangleApplication;
+
+  Arena *vulkan_arena;
+  Arena *scratch_arena;
+
+  VkInstance instance;
+  VkSurfaceKHR surface;
+
+  VkPhysicalDevice physical_device;
+  u32 graphic_queue_index;
+  VkDevice device;
+  VkQueue graphic_queue;
+
+  VkSwapchainKHR swapchain;
+  VkSurfaceFormatKHR swapchain_format;
+  VkExtent2D swap_extent;
+  u32 swapchain_images_count;
+  VkImage *swapchain_images;
+  VkImageView *swapchain_image_views;
+
+  VkPipelineLayout pipeline_layout;
+  VkPipeline pipeline;
+
+  VkCommandPool command_pool;
+  VkCommandBuffer command_buffer;
+
+  VkSemaphore present_sema;
+  VkSemaphore render_sema;
+  VkFence draw_fence;
+} Application;
 
 bool get_extensions(Arena *vulkan_arena, u32 *extension_count,
                     const char ***extension_names);
@@ -32,38 +60,55 @@ bool get_layers(Arena *arena, u32 *layer_count, const char ***layer_properties);
 
 bool read_shader_file(Arena *arena, const char *path, Str *out);
 
+static int init_vulkan(Application *app);
+static int init_glfw_window(Application *app);
+static void cleanup(Application *app);
+void transition_image_layout(Application *app, u32 imageIndex,
+                             VkImageLayout old_layout, VkImageLayout new_layout,
+                             VkAccessFlags2 src_access_mask,
+                             VkAccessFlags2 dst_access_mask,
+                             VkPipelineStageFlags2 src_stage_mask,
+                             VkPipelineStageFlags2 dst_stage_mask);
+
 //@ Init
-static int initVulkan(HelloTriangleApplication *app) {
-  Arena *vulkan_arena = arena_create(ARENA_DEFAULT_BLOCK_SIZE);
-  Arena *scratch_arena = arena_create(ARENA_DEFAULT_BLOCK_SIZE);
+static int init_vulkan(Application *app) {
+  app->vulkan_arena = arena_create(ARENA_DEFAULT_BLOCK_SIZE);
+  app->scratch_arena = arena_create(ARENA_DEFAULT_BLOCK_SIZE);
+  app->instance = VK_NULL_HANDLE;
+  app->surface = VK_NULL_HANDLE;
+  app->physical_device = VK_NULL_HANDLE;
+  app->device = VK_NULL_HANDLE;
+  app->graphic_queue = VK_NULL_HANDLE;
+  app->swapchain = VK_NULL_HANDLE;
+  app->swapchain_images_count = 0;
+  app->swapchain_images = VK_NULL_HANDLE;
+  app->swapchain_image_views = VK_NULL_HANDLE;
+  app->pipeline = VK_NULL_HANDLE;
+  app->command_pool = VK_NULL_HANDLE;
+  app->command_buffer = VK_NULL_HANDLE;
+  app->present_sema = VK_NULL_HANDLE;
+  app->render_sema = VK_NULL_HANDLE;
+  app->draw_fence = VK_NULL_HANDLE;
+
   VkResult result = VK_SUCCESS;
-  VkInstance instance = VK_NULL_HANDLE;
-  VkSurfaceKHR surface = VK_NULL_HANDLE;
-  VkPhysicalDevice physical_device = VK_NULL_HANDLE;
-  VkDevice device = VK_NULL_HANDLE;
-  VkQueue graphic_queue = VK_NULL_HANDLE;
-  VkSwapchainKHR swapchain = VK_NULL_HANDLE;
-  u32 swapchain_images_count = 0;
-  VkImage *swapchain_images = VK_NULL_HANDLE;
-  VkImageView *swapchain_image_views = VK_NULL_HANDLE;
-  VkPipeline pipeline = VK_NULL_HANDLE;
-  VkBuffer buffer = VK_NULL_HANDLE;
 
   // @instance
   {
-    ArenaTemp scratch = arena_temp_begin(scratch_arena);
+    ArenaTemp scratch = arena_temp_begin(app->scratch_arena);
     u32 extension_count;
     const char **extension_names = NULL;
-    if (!get_extensions(scratch_arena, &extension_count, &extension_names)) {
+    if (!get_extensions(scratch.arena, &extension_count, &extension_names)) {
       fprintf(stderr, "Vulkan error: failed to resolve instance extensions\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
 
     u32 layer_count;
     const char **layer_names = NULL;
-    if (!get_layers(scratch_arena, &layer_count, &layer_names)) {
+    if (!get_layers(scratch.arena, &layer_count, &layer_names)) {
       fprintf(stderr, "Vulkan error: failed to resolve validation layers\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
     const VkApplicationInfo appInfo = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -82,11 +127,12 @@ static int initVulkan(HelloTriangleApplication *app) {
         .ppEnabledLayerNames = layer_names,
     };
 
-    result = vkCreateInstance(&createInfo, NULL, &instance);
+    result = vkCreateInstance(&createInfo, NULL, &app->instance);
 
     if (result != VK_SUCCESS) {
       fprintf(stderr, "Vulkan error: failed to create instance\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
 
     printf("vk::Instance created\n");
@@ -94,10 +140,12 @@ static int initVulkan(HelloTriangleApplication *app) {
   }
   // @surface
   {
-    result = glfwCreateWindowSurface(instance, app->window, NULL, &surface);
+    result = glfwCreateWindowSurface(app->instance, app->window, NULL,
+                                     &app->surface);
     if (result != VK_SUCCESS) {
       fprintf(stderr, "GLFW error: failed to create a window surface");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
     printf("vk::Surface created\n");
   }
@@ -119,48 +167,52 @@ static int initVulkan(HelloTriangleApplication *app) {
       sizeof(required_device_extension_names) /
       sizeof(required_device_extension_names[0]);
   {
-    ArenaTemp scratch = arena_temp_begin(scratch_arena);
+    ArenaTemp scratch = arena_temp_begin(app->scratch_arena);
     u32 physical_device_count = 0;
-    result = vkEnumeratePhysicalDevices(instance, &physical_device_count, NULL);
+    result =
+        vkEnumeratePhysicalDevices(app->instance, &physical_device_count, NULL);
     if (result != VK_SUCCESS || physical_device_count == 0) {
       fprintf(stderr, "Vulkan error: no physical device found\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
     VkPhysicalDevice *physical_devices = ARENA_PUSH_ARRAY(
-        scratch_arena, physical_device_count, VkPhysicalDevice);
-    result = vkEnumeratePhysicalDevices(instance, &physical_device_count,
+        scratch.arena, physical_device_count, VkPhysicalDevice);
+    result = vkEnumeratePhysicalDevices(app->instance, &physical_device_count,
                                         physical_devices);
 
     if (result != VK_SUCCESS) {
       fprintf(stderr, "Vulkan error: failed to enumerate physical devices\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
-    physical_device = physical_devices[0];
+    app->physical_device = physical_devices[0];
 
     // verify 1.3 support
     VkPhysicalDeviceProperties2 physical_device_properties = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    vkGetPhysicalDeviceProperties2(physical_device,
+    vkGetPhysicalDeviceProperties2(app->physical_device,
                                    &physical_device_properties);
     if (physical_device_properties.properties.apiVersion < VK_API_VERSION_1_3) {
       fprintf(stderr, "Vulkan error: physical device do not support 1.3.");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
 
     // verify graphic queue
     u32 physical_device_queue_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(
-        physical_device, &physical_device_queue_count, NULL);
+        app->physical_device, &physical_device_queue_count, NULL);
     VkQueueFamilyProperties *physical_device_queue_properties =
-        ARENA_PUSH_ARRAY(scratch_arena, physical_device_queue_count,
+        ARENA_PUSH_ARRAY(scratch.arena, physical_device_queue_count,
                          VkQueueFamilyProperties);
-    vkGetPhysicalDeviceQueueFamilyProperties(physical_device,
+    vkGetPhysicalDeviceQueueFamilyProperties(app->physical_device,
                                              &physical_device_queue_count,
                                              physical_device_queue_properties);
     VkBool32 supports_surface = false;
     for (u32 i = 0; i < physical_device_queue_count; ++i) {
-      result = vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, i, surface,
-                                                    &supports_surface);
+      result = vkGetPhysicalDeviceSurfaceSupportKHR(
+          app->physical_device, i, app->surface, &supports_surface);
       if (result != VK_SUCCESS) {
         fprintf(stderr, "Vulkan error: unable to test if physical device "
                         "support vk surface.");
@@ -176,17 +228,18 @@ static int initVulkan(HelloTriangleApplication *app) {
     if (graphic_queue_index == UINT32_MAX) {
       fprintf(stderr,
               "Vulkan error: physical device does not support graphic queue\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
 
     // verify swapchain extension
     u32 extension_count = 0;
-    vkEnumerateDeviceExtensionProperties(physical_device, NULL,
+    vkEnumerateDeviceExtensionProperties(app->physical_device, NULL,
                                          &extension_count, NULL);
     VkExtensionProperties *extension_properties =
-        ARENA_PUSH_ARRAY(scratch_arena, extension_count, VkExtensionProperties);
+        ARENA_PUSH_ARRAY(scratch.arena, extension_count, VkExtensionProperties);
     vkEnumerateDeviceExtensionProperties(
-        physical_device, NULL, &extension_count, extension_properties);
+        app->physical_device, NULL, &extension_count, extension_properties);
 
     bool supports_swapchain = false;
     for (u32 i = 0; i < required_device_extension_count; i++) {
@@ -199,17 +252,19 @@ static int initVulkan(HelloTriangleApplication *app) {
     if (!supports_swapchain) {
       fprintf(stderr,
               "Vulkan error: physical device does not support swapchain\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
 
     // verify dynamic rendering feature
-    vkGetPhysicalDeviceFeatures2(physical_device, &device_features);
+    vkGetPhysicalDeviceFeatures2(app->physical_device, &device_features);
 
     if (!vulkan13_features.dynamicRendering ||
         !extended_dynamic_state_features.extendedDynamicState) {
       fprintf(stderr,
               "Vulkan error: physical device does not dynamic rendering\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
 
     printf("vk::PhysicalDevice created\n");
@@ -218,7 +273,7 @@ static int initVulkan(HelloTriangleApplication *app) {
 
   // @logical device
   {
-    float queue_priority = 1.f;
+    f32 queue_priority = 1.f;
     VkDeviceQueueCreateInfo device_queue_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueCount = 1,
@@ -231,24 +286,26 @@ static int initVulkan(HelloTriangleApplication *app) {
         .pQueueCreateInfos = &device_queue_info,
         .enabledExtensionCount = required_device_extension_count,
         .ppEnabledExtensionNames = required_device_extension_names};
-    result = vkCreateDevice(physical_device, &device_info, NULL, &device);
+    result =
+        vkCreateDevice(app->physical_device, &device_info, NULL, &app->device);
     if (result != VK_SUCCESS) {
       fprintf(stderr, "Vulkan error: failed to create logical device\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
-    vkGetDeviceQueue(device, graphic_queue_index, 0, &graphic_queue);
+    vkGetDeviceQueue(app->device, graphic_queue_index, 0, &app->graphic_queue);
 
     printf("vk::LogicalDevice (and queue handle) created\n");
   }
 
   // @swapchain
   VkSurfaceFormatKHR swapchain_format;
-  ArenaTemp swapchain_scratch = arena_temp_begin(scratch_arena);
+  ArenaTemp swapchain_scratch = arena_temp_begin(app->scratch_arena);
   VkExtent2D swap_extent;
   {
     VkSurfaceCapabilitiesKHR capabilities;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface,
-                                              &capabilities);
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(app->physical_device,
+                                              app->surface, &capabilities);
     swap_extent = capabilities.currentExtent;
 
     if (swap_extent.width == UINT32_MAX) {
@@ -269,15 +326,16 @@ static int initVulkan(HelloTriangleApplication *app) {
     }
 
     u32 formats_count;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface,
+    vkGetPhysicalDeviceSurfaceFormatsKHR(app->physical_device, app->surface,
                                          &formats_count, NULL);
     if (formats_count == 0) {
       fprintf(stderr, "Vulkan error: no present mode available\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
-    VkSurfaceFormatKHR *available_formats =
-        ARENA_PUSH_ARRAY(scratch_arena, formats_count, VkSurfaceFormatKHR);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface,
+    VkSurfaceFormatKHR *available_formats = ARENA_PUSH_ARRAY(
+        swapchain_scratch.arena, formats_count, VkSurfaceFormatKHR);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(app->physical_device, app->surface,
                                          &formats_count, available_formats);
 
     u32 format_index = 0;
@@ -292,17 +350,18 @@ static int initVulkan(HelloTriangleApplication *app) {
     swapchain_format = available_formats[format_index];
 
     u32 present_modes_count;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface,
-                                              &present_modes_count, NULL);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(
+        app->physical_device, app->surface, &present_modes_count, NULL);
     if (present_modes_count == 0) {
       fprintf(stderr, "Vulkan error: no present mode available\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
-    VkPresentModeKHR *available_present_modes =
-        ARENA_PUSH_ARRAY(scratch_arena, present_modes_count, VkPresentModeKHR);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface,
-                                              &present_modes_count,
-                                              available_present_modes);
+    VkPresentModeKHR *available_present_modes = ARENA_PUSH_ARRAY(
+        swapchain_scratch.arena, present_modes_count, VkPresentModeKHR);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(
+        app->physical_device, app->surface, &present_modes_count,
+        available_present_modes);
 
     u32 present_mode_index = 0;
     for (u32 i = 0; i < present_modes_count; i++) {
@@ -317,7 +376,7 @@ static int initVulkan(HelloTriangleApplication *app) {
 
     VkSwapchainCreateInfoKHR swapchain_create_info = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-        .surface = surface,
+        .surface = app->surface,
         .minImageCount = swap_image_count,
         .imageFormat = swapchain_format.format,
         .imageColorSpace = swapchain_format.colorSpace,
@@ -330,25 +389,29 @@ static int initVulkan(HelloTriangleApplication *app) {
         .presentMode = available_present_modes[present_mode_index],
         .clipped = true};
 
-    vkCreateSwapchainKHR(device, &swapchain_create_info, NULL, &swapchain);
-    vkGetSwapchainImagesKHR(device, swapchain, &swapchain_images_count, NULL);
-    swapchain_images =
-        ARENA_PUSH_ARRAY(scratch_arena, swapchain_images_count, VkImage);
-    vkGetSwapchainImagesKHR(device, swapchain, &swapchain_images_count,
-                            swapchain_images);
+    vkCreateSwapchainKHR(app->device, &swapchain_create_info, NULL,
+                         &app->swapchain);
+    vkGetSwapchainImagesKHR(app->device, app->swapchain,
+                            &app->swapchain_images_count, NULL);
+    app->swapchain_images = ARENA_PUSH_ARRAY(
+        app->scratch_arena, app->swapchain_images_count, VkImage);
+    vkGetSwapchainImagesKHR(app->device, app->swapchain,
+                            &app->swapchain_images_count,
+                            app->swapchain_images);
 
     printf("vk::Swapchain (and images) created\n");
   }
 
   // @image views
   {
-    if (swapchain_images_count == 0) {
+    if (app->swapchain_images_count == 0) {
       fprintf(stderr, "Vulkan error: swapchain is empty\n");
-      goto cleanup;
+      cleanup(app);
+      return -1;
     }
 
-    swapchain_image_views =
-        ARENA_PUSH_ARRAY(vulkan_arena, swapchain_images_count, VkImageView);
+    app->swapchain_image_views = ARENA_PUSH_ARRAY(
+        app->vulkan_arena, app->swapchain_images_count, VkImageView);
     VkImageViewCreateInfo image_view_create_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
@@ -369,16 +432,17 @@ static int initVulkan(HelloTriangleApplication *app) {
             .a = VK_COMPONENT_SWIZZLE_A,
         }};
 
-    for (u32 i = 0; i < swapchain_images_count; i++) {
-      image_view_create_info.image = swapchain_images[i];
-      result = vkCreateImageView(device, &image_view_create_info, NULL,
-                                 &swapchain_image_views[i]);
+    for (u32 i = 0; i < app->swapchain_images_count; i++) {
+      image_view_create_info.image = app->swapchain_images[i];
+      result = vkCreateImageView(app->device, &image_view_create_info, NULL,
+                                 &app->swapchain_image_views[i]);
       if (result != VK_SUCCESS) {
         fprintf(stderr,
                 "Vulkan error: failed to created image view for swapchain "
                 "image %u",
                 i);
-        goto cleanup;
+        cleanup(app);
+        return -1;
       }
     }
 
@@ -389,10 +453,10 @@ static int initVulkan(HelloTriangleApplication *app) {
   // @render pipeline
   VkPipelineShaderStageCreateInfo shader_stage_infos[2];
   {
-    ArenaTemp scratch = arena_temp_begin(scratch_arena);
+    ArenaTemp scratch = arena_temp_begin(app->scratch_arena);
 
     Str shader_code = {0};
-    read_shader_file(scratch_arena, "./build/shaders/slang.spv", &shader_code);
+    read_shader_file(scratch.arena, "./build/shaders/slang.spv", &shader_code);
     str_print_hex(&shader_code);
 
     VkShaderModule shader_module;
@@ -400,10 +464,12 @@ static int initVulkan(HelloTriangleApplication *app) {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = shader_code.length,
         .pCode = (const u32 *)shader_code.value};
-    result = vkCreateShaderModule(device, &createInfo, NULL, &shader_module);
+    result =
+        vkCreateShaderModule(app->device, &createInfo, NULL, &shader_module);
     if (result != VK_SUCCESS) {
       fprintf(stderr, "Vulkan error: Failed to create shader module\n");
-      return false;
+      cleanup(app);
+      return -1;
     }
 
     VkPipelineShaderStageCreateInfo vertex_stage_info = {
@@ -437,8 +503,8 @@ static int initVulkan(HelloTriangleApplication *app) {
 
     VkViewport viewport = {.x = 0.0f,
                            .y = 0.0f,
-                           .width = (float)swap_extent.width,
-                           .height = (float)swap_extent.height,
+                           .width = (f32)swap_extent.width,
+                           .height = (f32)swap_extent.height,
                            .minDepth = 0.0f,
                            .maxDepth = 1.0f};
     VkRect2D scissor = {.offset = (VkOffset2D){0, 0}, .extent = swap_extent};
@@ -480,11 +546,12 @@ static int initVulkan(HelloTriangleApplication *app) {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 0,
         .pushConstantRangeCount = 0};
-    result = vkCreatePipelineLayout(device, &pipeline_layout_info, NULL,
+    result = vkCreatePipelineLayout(app->device, &pipeline_layout_info, NULL,
                                     &pipeline_layout);
     if (result != VK_SUCCESS) {
       fprintf(stderr, "Vulkan error: Failed to create pipeline layout\n");
-      return false;
+      cleanup(app);
+      return -1;
     }
     VkPipelineRenderingCreateInfo pipeline_rendering_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
@@ -505,51 +572,149 @@ static int initVulkan(HelloTriangleApplication *app) {
         .renderPass = NULL,
         .pNext = &pipeline_rendering_info};
 
-    result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
-                                       &pipeline_info, NULL, &pipeline);
+    result = vkCreateGraphicsPipelines(app->device, VK_NULL_HANDLE, 1,
+                                       &pipeline_info, NULL, &app->pipeline);
     arena_temp_end(scratch);
   }
 
+  // @command pool & buffer
+  {
+    VkCommandPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = graphic_queue_index};
+    result =
+        vkCreateCommandPool(app->device, &pool_info, NULL, &app->command_pool);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: Failed to create command pool\n");
+      cleanup(app);
+      return -1;
+    }
+
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = app->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1};
+
+    result = vkAllocateCommandBuffers(app->device, &alloc_info,
+                                      &app->command_buffer);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: Failed to allocate command buffers\n");
+      cleanup(app);
+      return -1;
+    }
+  }
+
+  // @sync object
+  {
+    result =
+        vkCreateSemaphore(app->device,
+                          &(VkSemaphoreCreateInfo){
+                              .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                          },
+                          NULL, &app->present_sema);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: Failed to create present semaphore\n");
+      cleanup(app);
+      return -1;
+    }
+    result =
+        vkCreateSemaphore(app->device,
+                          &(VkSemaphoreCreateInfo){
+                              .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                          },
+                          NULL, &app->render_sema);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: Failed to create render semaphore\n");
+      cleanup(app);
+      return -1;
+    }
+
+    result = vkCreateFence(app->device,
+                           &(VkFenceCreateInfo){
+                               .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                               .flags = VK_FENCE_CREATE_SIGNALED_BIT
+                           },
+                           NULL, &app->draw_fence);
+    if (result != VK_SUCCESS) {
+      fprintf(stderr, "Vulkan error: Failed to create draw fence\n");
+      cleanup(app);
+      return -1;
+    }
+  }
+
   return 0;
-
-cleanup:
-  if (buffer != VK_NULL_HANDLE)
-    vkDestroyBuffer(device, buffer, NULL);
-
-  if (swapchain_image_views != VK_NULL_HANDLE) {
-    for (u32 i = 0; i < swapchain_images_count; i++)
-      vkDestroyImageView(device, swapchain_image_views[i], NULL);
-  }
-
-  if (swapchain != VK_NULL_HANDLE)
-    vkDestroySwapchainKHR(device, swapchain, NULL);
-
-  if (device != VK_NULL_HANDLE)
-    vkDestroyDevice(device, NULL);
-
-  if (surface != VK_NULL_HANDLE) {
-    vkDestroySurfaceKHR(instance, surface, NULL);
-  }
-
-  if (instance != VK_NULL_HANDLE)
-    vkDestroyInstance(instance, NULL);
-
-  arena_destroy(vulkan_arena);
-  arena_destroy(scratch_arena);
-  return -1;
 }
 
-//@ Dispose
-static void cleanup(HelloTriangleApplication *app) {
+static void cleanup(Application *app) {
+  if (app->command_buffer != VK_NULL_HANDLE) {
+  }
+
+  if (app->command_pool != VK_NULL_HANDLE) {
+    vkDestroyCommandPool(app->device, app->command_pool, NULL);
+  }
+
+  if (app->swapchain_image_views != VK_NULL_HANDLE) {
+    for (u32 i = 0; i < app->swapchain_images_count; i++)
+      vkDestroyImageView(app->device, app->swapchain_image_views[i], NULL);
+  }
+
+  if (app->swapchain != VK_NULL_HANDLE)
+    vkDestroySwapchainKHR(app->device, app->swapchain, NULL);
+
+  if (app->device != VK_NULL_HANDLE)
+    vkDestroyDevice(app->device, NULL);
+
+  if (app->surface != VK_NULL_HANDLE) {
+    vkDestroySurfaceKHR(app->instance, app->surface, NULL);
+  }
+
+  if (app->instance != VK_NULL_HANDLE)
+    vkDestroyInstance(app->instance, NULL);
+
+  arena_destroy(app->vulkan_arena);
+  arena_destroy(app->scratch_arena);
+
   if (app->window != NULL) {
     glfwDestroyWindow(app->window);
     app->window = NULL;
   }
-
   glfwTerminate();
 }
 
-static int initWindow(HelloTriangleApplication *app) {
+void transition_image_layout(Application *app, u32 imageIndex,
+                             VkImageLayout old_layout, VkImageLayout new_layout,
+                             VkAccessFlags2 src_access_mask,
+                             VkAccessFlags2 dst_access_mask,
+                             VkPipelineStageFlags2 src_stage_mask,
+                             VkPipelineStageFlags2 dst_stage_mask) {
+  VkImageMemoryBarrier2 barrier = {
+      .srcStageMask = src_stage_mask,
+      .srcAccessMask = src_access_mask,
+      .dstStageMask = dst_stage_mask,
+      .dstAccessMask = dst_access_mask,
+      .oldLayout = old_layout,
+      .newLayout = new_layout,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = (app->swapchain_images)[imageIndex],
+      .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                           .baseMipLevel = 0,
+                           .levelCount = 1,
+                           .baseArrayLayer = 0,
+                           .layerCount = 1}};
+
+  VkDependencyInfo dependency_info = {.sType =
+                                          VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                      .dependencyFlags = 0,
+                                      .imageMemoryBarrierCount = 1,
+                                      .pImageMemoryBarriers = &barrier};
+
+  vkCmdPipelineBarrier2(app->command_buffer, &dependency_info);
+}
+
+static int init_glfw_window(Application *app) {
   if (!glfwInit()) {
     fprintf(stderr, "Failed to initialize GLFW\n");
     return -1;
@@ -571,23 +736,138 @@ static int initWindow(HelloTriangleApplication *app) {
   return 0;
 }
 
-//@ MainLoop
-static void mainLoop(HelloTriangleApplication *app) {
-  while (!glfwWindowShouldClose(app->window)) {
-    glfwPollEvents();
+int draw_frame(Application *app) {
+  // await for previous frame to be drawn
+  VkResult result =
+      vkWaitForFences(app->device, 1, &app->draw_fence, true, UINT64_MAX);
+  if (result != VK_SUCCESS) {
+    fprintf(stderr, "Draw frame error: unable to wait for draw fence");
+    return -1;
   }
+  result = vkResetFences(app->device, 1, &app->draw_fence);
+  if (result != VK_SUCCESS) {
+    fprintf(stderr, "Draw frame error: unable to reset draw fence");
+    return -1;
+  }
+
+  // acquire next image from swapchain
+  uint32_t image_index = 0;
+  result = vkAcquireNextImageKHR(app->device, app->swapchain, UINT64_MAX,
+                                 app->present_sema, NULL, &image_index);
+  if (result != VK_SUCCESS) {
+    fprintf(stderr,
+            "Draw frame error: unable to acquire next image from swapchain");
+    return -1;
+  }
+
+  // draw command recording
+  vkBeginCommandBuffer(app->command_buffer,
+                       &(VkCommandBufferBeginInfo){
+                           .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                       });
+
+  transition_image_layout(
+      app,
+      image_index, // todo change
+      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+      (VkAccessFlags2){}, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+  VkRenderingAttachmentInfo attachment_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .imageView = app->swapchain_image_views[image_index],
+      .imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      .clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}}}};
+  VkRenderingInfo rendering_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = {.offset = {0, 0}, .extent = app->swap_extent},
+      .layerCount = 1,
+      .colorAttachmentCount = 1,
+      .pColorAttachments = &attachment_info};
+
+  vkCmdBeginRendering(app->command_buffer, &rendering_info);
+
+  vkCmdBindPipeline(app->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    app->pipeline);
+
+  vkCmdSetViewport(app->command_buffer, 0., 1.,
+                   &(VkViewport){0., 0., (f32)app->swap_extent.width,
+                                 (f32)app->swap_extent.width, 0., 1.});
+  vkCmdSetScissor(app->command_buffer, 0., 1.,
+                  &(VkRect2D){{0, 0}, app->swap_extent});
+
+  vkCmdDraw(app->command_buffer, 3, 1, 0, 0);
+
+  vkCmdEndRendering(app->command_buffer);
+
+  transition_image_layout(
+      app,
+      image_index, // todo change
+      VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, (VkAccessFlags2){},
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
+  vkEndCommandBuffer(app->command_buffer);
+
+  // submit command buffer to queue
+  const VkPipelineStageFlags wait_dst_stage_mask =
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  const VkSubmitInfo submit_info = {
+
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .waitSemaphoreCount = 1,
+      .pWaitSemaphores = &app->present_sema,
+      .pWaitDstStageMask = &wait_dst_stage_mask,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &app->command_buffer,
+      .signalSemaphoreCount = 1,
+      .pSignalSemaphores = &app->render_sema};
+
+  vkQueueSubmit(app->graphic_queue, 1, &submit_info, app->draw_fence);
+
+  const VkPresentInfoKHR present_info = {.sType =
+                                             VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                                         .waitSemaphoreCount = 1,
+                                         .pWaitSemaphores = &app->render_sema,
+                                         .swapchainCount = 1,
+                                         .pSwapchains = &app->swapchain,
+                                         .pImageIndices = &image_index};
+  result = vkQueuePresentKHR(app->graphic_queue, &present_info);
+  if (result != VK_SUCCESS) {
+    fprintf(stderr,
+            "Draw frame error: unable to present image");
+    return -1;
+  }
+
+  return 0;
+}
+
+//@ MainLoop
+static void main_loop(Application *app) {
+  printf("hi\n");
+  while (!glfwWindowShouldClose(app->window)) {
+    printf("start\n");
+    // glfwPollEvents();
+    draw_frame(app);
+    printf("ha\n");
+  }
+  printf("hum\n");
 }
 
 int main(void) {
-  HelloTriangleApplication app = {0};
+  Application app = {0};
 
-  if (initWindow(&app) != 0)
+  if (init_glfw_window(&app) != 0)
     return EXIT_FAILURE;
 
-  if (initVulkan(&app) != 0)
+  if (init_vulkan(&app) != 0)
     return EXIT_FAILURE;
 
-  mainLoop(&app);
+  printf("oi\n");
+  main_loop(&app);
   cleanup(&app);
 
   return EXIT_SUCCESS;
