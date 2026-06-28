@@ -46,9 +46,7 @@ typedef struct Application {
   u32 frame_index;
 
   VkPhysicalDevice physical_device;
-  u32 graphic_queue_index;
   VkDevice device;
-  VkQueue graphic_queue;
 
   VkSwapchainKHR swapchain;
   VkSurfaceFormatKHR swapchain_format;
@@ -60,8 +58,18 @@ typedef struct Application {
   VkPipelineLayout pipeline_layout;
   VkPipeline pipeline;
 
-  VkCommandPool command_pool;
-  VkCommandBuffer command_buffer;
+  VkBuffer vertex_buffer;
+  VkDeviceMemory vertex_buffer_memory;
+
+  u32 graphic_queue_index;
+  VkQueue graphic_queue;
+  VkCommandPool graphic_command_pool;
+  VkCommandBuffer *graphic_command_buffers;
+
+  u32 transfer_queue_index;
+  VkQueue transfer_queue;
+  VkCommandPool transfer_command_pool;
+  VkCommandBuffer transfer_command_buffer;
 
   VkSemaphore *image_available_semas;
   VkSemaphore *render_finish_semas;
@@ -72,33 +80,9 @@ typedef struct Vertex {
   Vec2 position;
   Vec3 color;
 } Vertex;
-
-#define vertices_count 3
-static Vertex vertices[vertices_count] = {
-    {{{0.0f, -0.5f}}, {{1.0f, 0.0f, 0.0f}}},
-    {{{0.5f, 0.5f}}, {{0.0f, 1.0f, 0.0f}}},
-    {{{-0.5f, 0.5f}}, {{0.0f, 0.0f, 1.0f}}}};
-
-static VkVertexInputBindingDescription vertex_get_binding_description() {
-  return (VkVertexInputBindingDescription){.binding = 0,
-                                           .stride = sizeof(Vertex),
-                                           .inputRate =
-                                               VK_VERTEX_INPUT_RATE_VERTEX};
-}
-
+static VkVertexInputBindingDescription vertex_get_binding_description();
 static void vertex_get_attribut_description(
-    VkVertexInputAttributeDescription description[2]) {
-  description[0] =
-      (VkVertexInputAttributeDescription){.location = 0,
-                                          .binding = 0,
-                                          .format = VK_FORMAT_R32G32_SFLOAT,
-                                          .offset = offsetof(Vertex, position)},
-  description[1] =
-      (VkVertexInputAttributeDescription){.location = 1,
-                                          .binding = 0,
-                                          .format = VK_FORMAT_R32G32B32_SFLOAT,
-                                          .offset = offsetof(Vertex, color)};
-}
+    VkVertexInputAttributeDescription description[2]);
 
 bool get_extensions(Arena *arena, u32 *extension_count,
                     const char ***extension_names);
@@ -108,8 +92,13 @@ bool get_layers(Arena *arena, u32 *layer_count, const char ***layer_properties);
 
 bool read_shader_file(Arena *arena, const char *path, Str *out);
 
-i32 find_memory_type(Application *app, u32 type_filter,
-                     VkMemoryPropertyFlags properties);
+int create_buffer(Application *app, VkDeviceSize size, VkBufferUsageFlags usage,
+                  VkMemoryPropertyFlags properties, VkSharingMode sharing_mode,
+                  uint32_t queueFamilyIndexCount,
+                  const uint32_t *pQueueFamilyIndices, VkBuffer *buffer,
+                  VkDeviceMemory *memory);
+int copy_buffer(VkQueue queue, VkCommandBuffer cmd, VkBuffer *src,
+                VkBuffer *dst, VkDeviceSize size);
 
 static int init_vulkan(Application *app);
 int create_swapchain(Arena *arena, Application *app,
@@ -123,6 +112,12 @@ void transition_image_layout(Application *app, VkCommandBuffer command_buffer,
                              VkAccessFlags2 dst_access_mask,
                              VkPipelineStageFlags2 src_stage_mask,
                              VkPipelineStageFlags2 dst_stage_mask);
+
+#define vertices_count 3
+static Vertex vertices[vertices_count] = {
+    {{{0.0f, -0.5f}}, {{1.0f, 0.0f, 0.0f}}},
+    {{{0.5f, 0.5f}}, {{0.0f, 1.0f, 0.0f}}},
+    {{{-0.5f, 0.5f}}, {{0.0f, 0.0f, 1.0f}}}};
 
 //@ Init
 static int init_vulkan(Application *app) {
@@ -253,6 +248,8 @@ static int init_vulkan(Application *app) {
     vkGetPhysicalDeviceQueueFamilyProperties(app->physical_device,
                                              &physical_device_queue_count,
                                              physical_device_queue_properties);
+
+    // graphic queue index
     VkBool32 supports_surface = false;
     for (u32 i = 0; i < physical_device_queue_count; ++i) {
       VKTRY(vkGetPhysicalDeviceSurfaceSupportKHR(
@@ -265,13 +262,26 @@ static int init_vulkan(Application *app) {
         break;
       }
     }
-    if (graphic_queue_index == UINT32_MAX) {
     if (app->graphic_queue_index == UINT32_MAX) {
       fprintf(stderr,
               "Vulkan error: physical device does not support graphic queue\n");
       cleanup(app);
       return -1;
     }
+    // transfer queue index
+    for (u32 i = 0; i < physical_device_queue_count; ++i) {
+      if (i != app->graphic_queue_index &&
+          physical_device_queue_properties[i].queueFlags &
+              VK_QUEUE_TRANSFER_BIT) {
+        app->transfer_queue_index = i;
+        break;
+      }
+    }
+    if (app->transfer_queue_index == UINT32_MAX) {
+      printf("Unable to find another queue than graphic for transfer.\n");
+      app->transfer_queue_index = app->graphic_queue_index;
+    }
+
 
     // verify swapchain extension
     u32 extension_count = 0;
@@ -315,16 +325,22 @@ static int init_vulkan(Application *app) {
   // @logical device
   {
     f32 queue_priority = 1.f;
-    VkDeviceQueueCreateInfo device_queue_info = {
-        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueCount = 1,
-        .pQueuePriorities = &queue_priority,
-        .queueFamilyIndex = app->graphic_queue_index};
+    VkDeviceQueueCreateInfo device_queue_info[2] = {
+        {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .queueCount = 1,
+         .pQueuePriorities = &queue_priority,
+         .queueFamilyIndex = app->graphic_queue_index},
+        {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .queueCount = 1,
+         .pQueuePriorities = &queue_priority,
+         .queueFamilyIndex = app->transfer_queue_index},
+    };
     VkDeviceCreateInfo device_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &device_features,
-        .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = &device_queue_info,
+        .queueCreateInfoCount =
+            app->graphic_queue_index == app->transfer_queue_index ? 1 : 2,
+        .pQueueCreateInfos = device_queue_info,
         .enabledExtensionCount = required_device_extension_count,
         .ppEnabledExtensionNames = required_device_extension_names};
     VKTRY(
@@ -332,6 +348,8 @@ static int init_vulkan(Application *app) {
         "Vulkan error: failed to create logical device");
     vkGetDeviceQueue(app->device, app->graphic_queue_index, 0,
                      &app->graphic_queue);
+    vkGetDeviceQueue(app->device, app->transfer_queue_index, 0,
+                     &app->transfer_queue);
 
     printf("vk::LogicalDevice (and queue handle) created\n");
   }
@@ -441,13 +459,12 @@ static int init_vulkan(Application *app) {
         .attachmentCount = 1,
         .pAttachments = &color_blend_attachment};
 
-    VkPipelineLayout pipeline_layout = NULL;
     VkPipelineLayoutCreateInfo pipeline_layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 0,
         .pushConstantRangeCount = 0};
     VKTRY(vkCreatePipelineLayout(app->device, &pipeline_layout_info, NULL,
-                                 &pipeline_layout),
+                                 &app->pipeline_layout),
           "Vulkan error: Failed to create pipeline layout");
     VkPipelineRenderingCreateInfo pipeline_rendering_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
@@ -464,53 +481,15 @@ static int init_vulkan(Application *app) {
         .pMultisampleState = &multisampling,
         .pColorBlendState = &color_blend_info,
         .pDynamicState = &dynamic_state,
-        .layout = pipeline_layout,
+        .layout = app->pipeline_layout,
         .renderPass = NULL,
         .pNext = &pipeline_rendering_info};
 
     VKTRY(vkCreateGraphicsPipelines(app->device, VK_NULL_HANDLE, 1,
                                     &pipeline_info, NULL, &app->pipeline),
           "Vulkan error: Failed to create graphics pipeline");
+    vkDestroyShaderModule(app->device, shader_module, NULL);
     arena_temp_end(scratch);
-  }
-
-  // @buffer (vertex)
-  {
-    VkBufferCreateInfo buffer_info = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = sizeof(vertices[0]) * vertices_count,
-        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    VKTRY(vkCreateBuffer(app->device, &buffer_info, NULL, &app->vertex_buffer),
-          "Vulkan error: Failed to create vertex buffer");
-    VkMemoryRequirements memory_requirements;
-    vkGetBufferMemoryRequirements(app->device, app->vertex_buffer,
-                                  &memory_requirements);
-    i32 memory_type_index =
-        find_memory_type(app, memory_requirements.memoryTypeBits,
-                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (memory_type_index < 0) {
-      fprintf(stderr, "Unable to find adequate memory type index.\n");
-      return -1;
-    }
-    VkMemoryAllocateInfo memory_allocate_info = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = memory_requirements.size,
-        .memoryTypeIndex = (u32)memory_type_index};
-    VKTRY(vkAllocateMemory(app->device, &memory_allocate_info, NULL,
-                           &app->vertex_buffer_memory),
-          "Vulkan error: Failed to allocate vertex buffer memory");
-    vkBindBufferMemory(app->device, app->vertex_buffer,
-                       app->vertex_buffer_memory, 0);
-
-    void *data;
-    VKTRY(vkMapMemory(app->device, app->vertex_buffer_memory, 0,
-                      buffer_info.size, 0, &data),
-          "Vulkan error: Failed to map memory for vertex buffer");
-
-    memcpy(data, vertices, buffer_info.size);
-    vkUnmapMemory(app->device, app->vertex_buffer_memory);
   }
 
   // @command pool & buffer
@@ -519,9 +498,9 @@ static int init_vulkan(Application *app) {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = app->graphic_queue_index};
-    VKTRY(
-        vkCreateCommandPool(app->device, &pool_info, NULL, &app->graphic_command_pool),
-        "Vulkan error: Failed to create command pool");
+    VKTRY(vkCreateCommandPool(app->device, &pool_info, NULL,
+                              &app->graphic_command_pool),
+          "Vulkan error: Failed to create graphic command pool");
 
     VkCommandBufferAllocateInfo alloc_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -533,12 +512,72 @@ static int init_vulkan(Application *app) {
         app->vulkan_arena, app->inflight_count, VkCommandBuffer);
     VKTRY(vkAllocateCommandBuffers(app->device, &alloc_info,
                                    app->graphic_command_buffers),
-          "Vulkan error: Failed to allocate command buffers");
-    app->graphic_command_buffers = ARENA_PUSH_ARRAY(
-        app->vulkan_arena, app->inflight_count, VkCommandBuffer);
-    VKTRY(vkAllocateCommandBuffers(app->device, &alloc_info,
-                                   app->graphic_command_buffers),
-          "Vulkan error: Failed to allocate command buffers");
+          "Vulkan error: Failed to allocate graphic command buffers");
+
+    VkCommandPoolCreateInfo transfer_pool_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = 0,
+        .queueFamilyIndex = app->transfer_queue_index};
+    VKTRY(vkCreateCommandPool(app->device, &transfer_pool_info, NULL,
+                              &app->transfer_command_pool),
+          "Vulkan error: Failed to create transfer command pool");
+
+    VkCommandBufferAllocateInfo transfer_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = app->transfer_command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1};
+    VKTRY(vkAllocateCommandBuffers(app->device, &transfer_alloc_info,
+                                   &app->transfer_command_buffer),
+          "Vulkan error: Failed to allocate transfer command buffer");
+  }
+
+  // @buffer (vertex)
+  {
+    VkDeviceSize buffer_size = sizeof(vertices[0]) * vertices_count;
+    VkBuffer staging_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    if (create_buffer(app, buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      VK_SHARING_MODE_EXCLUSIVE, 0, NULL, &staging_buffer,
+                      &staging_memory) != 0) {
+      return -1;
+    };
+
+    // RAM -> HOST_VISIBLE
+    void *data;
+    VKTRY(vkMapMemory(app->device, staging_memory, 0, buffer_size, 0, &data),
+          "Vulkan error: Failed to map memory for vertex buffer");
+
+    memcpy(data, vertices, buffer_size);
+    vkUnmapMemory(app->device, staging_memory);
+
+    VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
+    u32 queue_family_count = 0;
+    u32 *queue_families = NULL;
+
+    if (app->graphic_queue_index != app->transfer_queue_index) {
+      sharing_mode = VK_SHARING_MODE_CONCURRENT;
+      queue_family_count = 2;
+      queue_families =
+          (u32[2]){app->graphic_queue_index, app->transfer_queue_index};
+    }
+
+    if (create_buffer(app, buffer_size,
+                      VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sharing_mode,
+                      queue_family_count, queue_families, &app->vertex_buffer,
+                      &app->vertex_buffer_memory) != 0) {
+      return -1;
+    };
+
+    // HOST_VISIBLE -> DEVICE_LOCAL
+    if (copy_buffer(app->transfer_queue, app->transfer_command_buffer,
+                    &staging_buffer, &app->vertex_buffer, buffer_size) != 0) {
+      return -1;
+    };
   }
 
   // @sync object
@@ -761,12 +800,31 @@ static void cleanup(Application *app) {
     }
   }
 
+  if (app->vertex_buffer != VK_NULL_HANDLE)
+    vkDestroyBuffer(app->device, app->vertex_buffer, NULL);
+  if (app->vertex_buffer_memory != VK_NULL_HANDLE)
+    vkFreeMemory(app->device, app->vertex_buffer_memory, NULL);
+
   if (app->graphic_command_buffers != NULL) {
-    vkFreeCommandBuffers(app->device, app->graphic_command_pool, 1,
-                         app->graphic_command_buffers);
+    vkFreeCommandBuffers(app->device, app->graphic_command_pool,
+                         app->inflight_count, app->graphic_command_buffers);
   }
   if (app->graphic_command_pool != VK_NULL_HANDLE) {
     vkDestroyCommandPool(app->device, app->graphic_command_pool, NULL);
+  }
+  if (app->transfer_command_buffer != NULL) {
+    vkFreeCommandBuffers(app->device, app->transfer_command_pool, 1,
+                         &app->transfer_command_buffer);
+  }
+  if (app->transfer_command_pool != VK_NULL_HANDLE) {
+    vkDestroyCommandPool(app->device, app->transfer_command_pool, NULL);
+  }
+
+  if (app->pipeline_layout != NULL) {
+    vkDestroyPipelineLayout(app->device, app->pipeline_layout, NULL);
+  }
+  if (app->pipeline != NULL) {
+    vkDestroyPipeline(app->device, app->pipeline, NULL);
   }
 
   cleanup_swapchain(app);
@@ -1174,6 +1232,7 @@ bool read_shader_file(Arena *arena, const char *path, Str *out) {
   return true;
 }
 
+// @buffer
 i32 find_memory_type(Application *app, u32 type_filter,
                      VkMemoryPropertyFlags properties) {
   VkPhysicalDeviceMemoryProperties memory_properties;
@@ -1188,4 +1247,88 @@ i32 find_memory_type(Application *app, u32 type_filter,
   }
 
   return -1;
+}
+int create_buffer(Application *app, VkDeviceSize size, VkBufferUsageFlags usage,
+                  VkMemoryPropertyFlags properties, VkSharingMode sharing_mode,
+                  uint32_t queueFamilyIndexCount,
+                  const uint32_t *pQueueFamilyIndices, VkBuffer *buffer,
+                  VkDeviceMemory *memory) {
+
+  VkBufferCreateInfo buffer_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = size,
+      .usage = usage,
+      .sharingMode = sharing_mode,
+      .queueFamilyIndexCount = queueFamilyIndexCount,
+      .pQueueFamilyIndices = pQueueFamilyIndices};
+  VKTRY(vkCreateBuffer(app->device, &buffer_info, NULL, buffer),
+        "Vulkan error: Failed to create vertex buffer");
+  VkMemoryRequirements memory_requirements;
+  vkGetBufferMemoryRequirements(app->device, *buffer, &memory_requirements);
+  i32 memory_type_index =
+      find_memory_type(app, memory_requirements.memoryTypeBits, properties);
+  if (memory_type_index < 0) {
+    fprintf(stderr, "Unable to find adequate memory type index.\n");
+    return -1;
+  }
+  VkMemoryAllocateInfo memory_allocate_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = memory_requirements.size,
+      .memoryTypeIndex = (u32)memory_type_index};
+  VKTRY(vkAllocateMemory(app->device, &memory_allocate_info, NULL, memory),
+        "Vulkan error: Failed to allocate vertex buffer memory");
+  VKTRY(vkBindBufferMemory(app->device, *buffer, *memory, 0),
+        "Vulkan error: unable to bind buffer memory");
+  return 0;
+}
+int copy_buffer(VkQueue queue, VkCommandBuffer cmd, VkBuffer *src,
+                VkBuffer *dst, VkDeviceSize size) {
+  VKTRY(vkBeginCommandBuffer(
+            cmd,
+            &(VkCommandBufferBeginInfo){
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            }),
+        "Vulkan error: Failed to begin transfer command buffer");
+
+  VkBufferCopy copy_region = {
+      .srcOffset = 0,
+      .dstOffset = 0,
+      .size = size,
+  };
+  vkCmdCopyBuffer(cmd, *src, *dst, 1, &copy_region);
+
+  VKTRY(vkEndCommandBuffer(cmd),
+        "Vulkan error: Failed to end transfer command buffer");
+
+  VkSubmitInfo submit_info = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &cmd,
+  };
+
+  VKTRY(vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE),
+        "Vulkan error: Failed to submit transfer command buffer");
+
+  VKTRY(vkQueueWaitIdle(queue), "Vulkan error: Failed to wait transfer queue");
+  return 0;
+}
+static VkVertexInputBindingDescription vertex_get_binding_description() {
+  return (VkVertexInputBindingDescription){.binding = 0,
+                                           .stride = sizeof(Vertex),
+                                           .inputRate =
+                                               VK_VERTEX_INPUT_RATE_VERTEX};
+}
+static void vertex_get_attribut_description(
+    VkVertexInputAttributeDescription description[2]) {
+  description[0] =
+      (VkVertexInputAttributeDescription){.location = 0,
+                                          .binding = 0,
+                                          .format = VK_FORMAT_R32G32_SFLOAT,
+                                          .offset = offsetof(Vertex, position)},
+  description[1] =
+      (VkVertexInputAttributeDescription){.location = 1,
+                                          .binding = 0,
+                                          .format = VK_FORMAT_R32G32B32_SFLOAT,
+                                          .offset = offsetof(Vertex, color)};
 }
