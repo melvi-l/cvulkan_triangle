@@ -7,6 +7,8 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include "lib/math.h"
+
 #include "base.c"
 
 #ifdef VK_ENABLE_VALIDATION
@@ -66,13 +68,48 @@ typedef struct Application {
   VkFence *draw_fences;
 } Application;
 
-bool get_extensions(Arena *vulkan_arena, u32 *extension_count,
+typedef struct Vertex {
+  Vec2 position;
+  Vec3 color;
+} Vertex;
+
+#define vertices_count 3
+static Vertex vertices[vertices_count] = {
+    {{{0.0f, -0.5f}}, {{1.0f, 0.0f, 0.0f}}},
+    {{{0.5f, 0.5f}}, {{0.0f, 1.0f, 0.0f}}},
+    {{{-0.5f, 0.5f}}, {{0.0f, 0.0f, 1.0f}}}};
+
+static VkVertexInputBindingDescription vertex_get_binding_description() {
+  return (VkVertexInputBindingDescription){.binding = 0,
+                                           .stride = sizeof(Vertex),
+                                           .inputRate =
+                                               VK_VERTEX_INPUT_RATE_VERTEX};
+}
+
+static void vertex_get_attribut_description(
+    VkVertexInputAttributeDescription description[2]) {
+  description[0] =
+      (VkVertexInputAttributeDescription){.location = 0,
+                                          .binding = 0,
+                                          .format = VK_FORMAT_R32G32_SFLOAT,
+                                          .offset = offsetof(Vertex, position)},
+  description[1] =
+      (VkVertexInputAttributeDescription){.location = 1,
+                                          .binding = 0,
+                                          .format = VK_FORMAT_R32G32B32_SFLOAT,
+                                          .offset = offsetof(Vertex, color)};
+}
+
+bool get_extensions(Arena *arena, u32 *extension_count,
                     const char ***extension_names);
 bool has_extension(u32 actual_count, VkExtensionProperties *actual_props,
                    const char *const expected);
 bool get_layers(Arena *arena, u32 *layer_count, const char ***layer_properties);
 
 bool read_shader_file(Arena *arena, const char *path, Str *out);
+
+i32 find_memory_type(Application *app, u32 type_filter,
+                     VkMemoryPropertyFlags properties);
 
 static int init_vulkan(Application *app);
 int create_swapchain(Arena *arena, Application *app,
@@ -349,8 +386,15 @@ static int init_vulkan(Application *app) {
         .dynamicStateCount = 2,
         .pDynamicStates = dynamic_states};
 
+    VkVertexInputBindingDescription binding = vertex_get_binding_description();
+    VkVertexInputAttributeDescription attributes[2];
+    vertex_get_attribut_description(attributes);
     VkPipelineVertexInputStateCreateInfo vertex_input_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &binding,
+        .vertexAttributeDescriptionCount = 2,
+        .pVertexAttributeDescriptions = attributes,
     };
     VkPipelineInputAssemblyStateCreateInfo input_assembly_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -430,19 +474,50 @@ static int init_vulkan(Application *app) {
     arena_temp_end(scratch);
   }
 
+  // @buffer (vertex)
+  {
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = sizeof(vertices[0]) * vertices_count,
+        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VKTRY(vkCreateBuffer(app->device, &buffer_info, NULL, &app->vertex_buffer),
+          "Vulkan error: Failed to create vertex buffer");
+    VkMemoryRequirements memory_requirements;
+    vkGetBufferMemoryRequirements(app->device, app->vertex_buffer,
+                                  &memory_requirements);
+    i32 memory_type_index =
+        find_memory_type(app, memory_requirements.memoryTypeBits,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (memory_type_index < 0) {
+      fprintf(stderr, "Unable to find adequate memory type index.\n");
+      return -1;
+    }
+    VkMemoryAllocateInfo memory_allocate_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = memory_requirements.size,
+        .memoryTypeIndex = (u32)memory_type_index};
+    VKTRY(vkAllocateMemory(app->device, &memory_allocate_info, NULL,
+                           &app->vertex_buffer_memory),
+          "Vulkan error: Failed to allocate vertex buffer memory");
+    vkBindBufferMemory(app->device, app->vertex_buffer,
+                       app->vertex_buffer_memory, 0);
+
+    void *data;
+    VKTRY(vkMapMemory(app->device, app->vertex_buffer_memory, 0,
+                      buffer_info.size, 0, &data),
+          "Vulkan error: Failed to map memory for vertex buffer");
+
+    memcpy(data, vertices, buffer_info.size);
+    vkUnmapMemory(app->device, app->vertex_buffer_memory);
+  }
+
   // @command pool & buffer
   {
     VkCommandPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-        .queueFamilyIndex = graphic_queue_index};
-    result =
-        vkCreateCommandPool(app->device, &pool_info, NULL, &app->command_pool);
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: Failed to create command pool\n");
-      cleanup(app);
-      return -1;
-    }
         .queueFamilyIndex = app->graphic_queue_index};
     VKTRY(
         vkCreateCommandPool(app->device, &pool_info, NULL, &app->graphic_command_pool),
@@ -454,13 +529,6 @@ static int init_vulkan(Application *app) {
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = app->inflight_count};
 
-    result = vkAllocateCommandBuffers(app->device, &alloc_info,
-                                      &app->command_buffer);
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: Failed to allocate command buffers\n");
-      cleanup(app);
-      return -1;
-    }
     app->graphic_command_buffers = ARENA_PUSH_ARRAY(
         app->vulkan_arena, app->inflight_count, VkCommandBuffer);
     VKTRY(vkAllocateCommandBuffers(app->device, &alloc_info,
@@ -856,8 +924,11 @@ int draw_frame(Application *app) {
 
   vkCmdBindPipeline(*current_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     app->pipeline);
+  VkBuffer vertex_buffers[] = {app->vertex_buffer};
+  VkDeviceSize offsets[] = {0};
+  vkCmdBindVertexBuffers(*current_command_buffer, 0, 1, vertex_buffers,
+                         offsets);
 
-  vkCmdSetViewport(app->command_buffer, 0., 1.,
   // dynamic
   vkCmdSetViewport(*current_command_buffer, 0., 1.,
                    &(VkViewport){0., 0., (f32)app->swap_extent.width,
@@ -1101,4 +1172,20 @@ bool read_shader_file(Arena *arena, const char *path, Str *out) {
   out->value = buffer;
 
   return true;
+}
+
+i32 find_memory_type(Application *app, u32 type_filter,
+                     VkMemoryPropertyFlags properties) {
+  VkPhysicalDeviceMemoryProperties memory_properties;
+  vkGetPhysicalDeviceMemoryProperties(app->physical_device, &memory_properties);
+
+  for (i32 i = 0; i < (i32)memory_properties.memoryTypeCount; i++) {
+    if ((type_filter & (1 << i)) &&
+        (memory_properties.memoryTypes[i].propertyFlags & properties) ==
+            properties) {
+      return i;
+    }
+  }
+
+  return -1;
 }
