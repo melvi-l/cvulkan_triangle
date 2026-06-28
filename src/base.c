@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef int8_t i8;
@@ -49,7 +50,6 @@ typedef double f64;
     expr;                                                                      \
     printf("%s: %.3f ms\n", label, (glfwGetTime() - _t) * 1000.0);             \
   } while (0)
-
 
 // @arena
 #define ARENA_DEFAULT_BLOCK_SIZE KiB(4)
@@ -555,3 +555,10 @@ static inline u64 write_ring(u8 *ring, u64 ring_position, u64 ring_size,
                                                                                \
     return &node->value;                                                       \
   }
+
+f64 now_seconds() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+
+  return (f64)ts.tv_sec + (f64)ts.tv_nsec / 1000000000.0;
+}

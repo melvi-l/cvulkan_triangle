@@ -20,7 +20,18 @@ char const *validation_layer_names[] = {};
 const u32 validation_layer_count = 0;
 #endif
 
-typedef struct HelloTriangleApplication {
+#define VKTRY(expr, msg)                                                       \
+  do {                                                                         \
+    VkResult vk_result__ = (expr);                                             \
+    if (vk_result__ != VK_SUCCESS) {                                           \
+      fprintf(stderr, "%s: VkResult=%d\n", msg, vk_result__);                  \
+      return -1;                                                               \
+    }                                                                          \
+  } while (0)
+
+#define MAX_FRAMES_IN_FLIGHT 2
+
+typedef struct Application {
   GLFWwindow *window;
 
   Arena *vulkan_arena;
@@ -28,6 +39,9 @@ typedef struct HelloTriangleApplication {
 
   VkInstance instance;
   VkSurfaceKHR surface;
+
+  u32 inflight_count;
+  u32 frame_index;
 
   VkPhysicalDevice physical_device;
   u32 graphic_queue_index;
@@ -47,9 +61,9 @@ typedef struct HelloTriangleApplication {
   VkCommandPool command_pool;
   VkCommandBuffer command_buffer;
 
-  VkSemaphore present_sema;
-  VkSemaphore render_sema;
-  VkFence draw_fence;
+  VkSemaphore *image_available_semas;
+  VkSemaphore *render_finish_semas;
+  VkFence *draw_fences;
 } Application;
 
 bool get_extensions(Arena *vulkan_arena, u32 *extension_count,
@@ -61,10 +75,13 @@ bool get_layers(Arena *arena, u32 *layer_count, const char ***layer_properties);
 bool read_shader_file(Arena *arena, const char *path, Str *out);
 
 static int init_vulkan(Application *app);
+int create_swapchain(Arena *arena, Application *app,
+                     VkSurfaceFormatKHR *swapchain_format);
 static int init_glfw_window(Application *app);
 static void cleanup(Application *app);
-void transition_image_layout(Application *app, u32 imageIndex,
-                             VkImageLayout old_layout, VkImageLayout new_layout,
+void transition_image_layout(Application *app, VkCommandBuffer command_buffer,
+                             u32 image_index, VkImageLayout old_layout,
+                             VkImageLayout new_layout,
                              VkAccessFlags2 src_access_mask,
                              VkAccessFlags2 dst_access_mask,
                              VkPipelineStageFlags2 src_stage_mask,
@@ -76,21 +93,24 @@ static int init_vulkan(Application *app) {
   app->scratch_arena = arena_create(ARENA_DEFAULT_BLOCK_SIZE);
   app->instance = VK_NULL_HANDLE;
   app->surface = VK_NULL_HANDLE;
+  app->inflight_count = MAX_FRAMES_IN_FLIGHT;
+  app->frame_index = 0;
   app->physical_device = VK_NULL_HANDLE;
   app->device = VK_NULL_HANDLE;
+  app->graphic_queue_index = UINT32_MAX;
   app->graphic_queue = VK_NULL_HANDLE;
   app->swapchain = VK_NULL_HANDLE;
   app->swapchain_images_count = 0;
   app->swapchain_images = VK_NULL_HANDLE;
   app->swapchain_image_views = VK_NULL_HANDLE;
   app->pipeline = VK_NULL_HANDLE;
-  app->command_pool = VK_NULL_HANDLE;
-  app->command_buffer = VK_NULL_HANDLE;
-  app->present_sema = VK_NULL_HANDLE;
-  app->render_sema = VK_NULL_HANDLE;
-  app->draw_fence = VK_NULL_HANDLE;
-
-  VkResult result = VK_SUCCESS;
+  app->vertex_buffer = VK_NULL_HANDLE;
+  app->vertex_buffer_memory = VK_NULL_HANDLE;
+  app->graphic_command_pool = VK_NULL_HANDLE;
+  app->graphic_command_buffers = NULL;
+  app->image_available_semas = NULL;
+  app->render_finish_semas = NULL;
+  app->draw_fences = NULL;
 
   // @instance
   {
@@ -127,34 +147,29 @@ static int init_vulkan(Application *app) {
         .ppEnabledLayerNames = layer_names,
     };
 
-    result = vkCreateInstance(&createInfo, NULL, &app->instance);
-
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: failed to create instance\n");
-      cleanup(app);
-      return -1;
-    }
+    VKTRY(vkCreateInstance(&createInfo, NULL, &app->instance),
+          "Vulkan error: failed to create instance");
 
     printf("vk::Instance created\n");
     arena_temp_end(scratch);
   }
   // @surface
   {
-    result = glfwCreateWindowSurface(app->instance, app->window, NULL,
-                                     &app->surface);
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "GLFW error: failed to create a window surface");
-      cleanup(app);
-      return -1;
-    }
+    VKTRY(glfwCreateWindowSurface(app->instance, app->window, NULL,
+                                  &app->surface),
+          "GLFW error: failed to create a window surface");
     printf("vk::Surface created\n");
   }
 
   // @physical device
-  u32 graphic_queue_index = UINT32_MAX;
+  VkPhysicalDeviceVulkan11Features vulkan11_features = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+      .shaderDrawParameters = true,
+  };
   VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features =
       {.sType =
-           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+       .pNext = &vulkan11_features};
   VkPhysicalDeviceVulkan13Features vulkan13_features = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
       .pNext = &extended_dynamic_state_features};
@@ -169,23 +184,15 @@ static int init_vulkan(Application *app) {
   {
     ArenaTemp scratch = arena_temp_begin(app->scratch_arena);
     u32 physical_device_count = 0;
-    result =
-        vkEnumeratePhysicalDevices(app->instance, &physical_device_count, NULL);
-    if (result != VK_SUCCESS || physical_device_count == 0) {
-      fprintf(stderr, "Vulkan error: no physical device found\n");
-      cleanup(app);
-      return -1;
-    }
+    VKTRY(
+        vkEnumeratePhysicalDevices(app->instance, &physical_device_count, NULL),
+        "Vulkan error: no physical device found");
     VkPhysicalDevice *physical_devices = ARENA_PUSH_ARRAY(
         scratch.arena, physical_device_count, VkPhysicalDevice);
-    result = vkEnumeratePhysicalDevices(app->instance, &physical_device_count,
-                                        physical_devices);
 
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: failed to enumerate physical devices\n");
-      cleanup(app);
-      return -1;
-    }
+    VKTRY(vkEnumeratePhysicalDevices(app->instance, &physical_device_count,
+                                     physical_devices),
+          "Vulkan error: failed to enumerate physical devices");
     app->physical_device = physical_devices[0];
 
     // verify 1.3 support
@@ -211,21 +218,18 @@ static int init_vulkan(Application *app) {
                                              physical_device_queue_properties);
     VkBool32 supports_surface = false;
     for (u32 i = 0; i < physical_device_queue_count; ++i) {
-      result = vkGetPhysicalDeviceSurfaceSupportKHR(
-          app->physical_device, i, app->surface, &supports_surface);
-      if (result != VK_SUCCESS) {
-        fprintf(stderr, "Vulkan error: unable to test if physical device "
-                        "support vk surface.");
-        continue;
-      }
+      VKTRY(vkGetPhysicalDeviceSurfaceSupportKHR(
+                app->physical_device, i, app->surface, &supports_surface),
+            "Vulkan error: unable to test if physical device");
       if (physical_device_queue_properties[i].queueFlags &
               VK_QUEUE_GRAPHICS_BIT &&
           supports_surface) {
-        graphic_queue_index = i;
+        app->graphic_queue_index = i;
         break;
       }
     }
     if (graphic_queue_index == UINT32_MAX) {
+    if (app->graphic_queue_index == UINT32_MAX) {
       fprintf(stderr,
               "Vulkan error: physical device does not support graphic queue\n");
       cleanup(app);
@@ -278,7 +282,7 @@ static int init_vulkan(Application *app) {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueCount = 1,
         .pQueuePriorities = &queue_priority,
-        .queueFamilyIndex = graphic_queue_index};
+        .queueFamilyIndex = app->graphic_queue_index};
     VkDeviceCreateInfo device_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &device_features,
@@ -286,14 +290,11 @@ static int init_vulkan(Application *app) {
         .pQueueCreateInfos = &device_queue_info,
         .enabledExtensionCount = required_device_extension_count,
         .ppEnabledExtensionNames = required_device_extension_names};
-    result =
-        vkCreateDevice(app->physical_device, &device_info, NULL, &app->device);
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: failed to create logical device\n");
-      cleanup(app);
-      return -1;
-    }
-    vkGetDeviceQueue(app->device, graphic_queue_index, 0, &app->graphic_queue);
+    VKTRY(
+        vkCreateDevice(app->physical_device, &device_info, NULL, &app->device),
+        "Vulkan error: failed to create logical device");
+    vkGetDeviceQueue(app->device, app->graphic_queue_index, 0,
+                     &app->graphic_queue);
 
     printf("vk::LogicalDevice (and queue handle) created\n");
   }
@@ -301,154 +302,14 @@ static int init_vulkan(Application *app) {
   // @swapchain
   VkSurfaceFormatKHR swapchain_format;
   ArenaTemp swapchain_scratch = arena_temp_begin(app->scratch_arena);
-  VkExtent2D swap_extent;
-  {
-    VkSurfaceCapabilitiesKHR capabilities;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(app->physical_device,
-                                              app->surface, &capabilities);
-    swap_extent = capabilities.currentExtent;
-
-    if (swap_extent.width == UINT32_MAX) {
-      int w, h;
-      glfwGetFramebufferSize(app->window, &w, &h);
-      swap_extent = (VkExtent2D){
-          .width = clamp((u32)w, capabilities.minImageExtent.width,
-                         capabilities.maxImageExtent.width),
-          .height = clamp((u32)h, capabilities.minImageExtent.height,
-                          capabilities.maxImageExtent.height),
-      };
-    }
-
-    u32 swap_image_count = max(3, capabilities.minImageCount);
-    if (0 < capabilities.maxImageCount &&
-        capabilities.maxImageCount < swap_image_count) {
-      swap_image_count = capabilities.maxImageCount;
-    }
-
-    u32 formats_count;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(app->physical_device, app->surface,
-                                         &formats_count, NULL);
-    if (formats_count == 0) {
-      fprintf(stderr, "Vulkan error: no present mode available\n");
-      cleanup(app);
-      return -1;
-    }
-    VkSurfaceFormatKHR *available_formats = ARENA_PUSH_ARRAY(
-        swapchain_scratch.arena, formats_count, VkSurfaceFormatKHR);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(app->physical_device, app->surface,
-                                         &formats_count, available_formats);
-
-    u32 format_index = 0;
-    for (u32 i = 0; i < formats_count; i++) {
-      if (available_formats[i].format == VK_FORMAT_B8G8R8A8_SRGB &&
-          available_formats[i].colorSpace ==
-              VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-        format_index = i;
-        break;
-      }
-    }
-    swapchain_format = available_formats[format_index];
-
-    u32 present_modes_count;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(
-        app->physical_device, app->surface, &present_modes_count, NULL);
-    if (present_modes_count == 0) {
-      fprintf(stderr, "Vulkan error: no present mode available\n");
-      cleanup(app);
-      return -1;
-    }
-    VkPresentModeKHR *available_present_modes = ARENA_PUSH_ARRAY(
-        swapchain_scratch.arena, present_modes_count, VkPresentModeKHR);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(
-        app->physical_device, app->surface, &present_modes_count,
-        available_present_modes);
-
-    u32 present_mode_index = 0;
-    for (u32 i = 0; i < present_modes_count; i++) {
-      if (available_present_modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
-        present_mode_index = i;
-        break;
-      }
-      if (available_present_modes[i] == VK_PRESENT_MODE_FIFO_KHR) {
-        present_mode_index = i;
-      }
-    }
-
-    VkSwapchainCreateInfoKHR swapchain_create_info = {
-        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-        .surface = app->surface,
-        .minImageCount = swap_image_count,
-        .imageFormat = swapchain_format.format,
-        .imageColorSpace = swapchain_format.colorSpace,
-        .imageExtent = swap_extent,
-        .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .preTransform = capabilities.currentTransform,
-        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-        .presentMode = available_present_modes[present_mode_index],
-        .clipped = true};
-
-    vkCreateSwapchainKHR(app->device, &swapchain_create_info, NULL,
-                         &app->swapchain);
-    vkGetSwapchainImagesKHR(app->device, app->swapchain,
-                            &app->swapchain_images_count, NULL);
-    app->swapchain_images = ARENA_PUSH_ARRAY(
-        app->scratch_arena, app->swapchain_images_count, VkImage);
-    vkGetSwapchainImagesKHR(app->device, app->swapchain,
-                            &app->swapchain_images_count,
-                            app->swapchain_images);
-
-    printf("vk::Swapchain (and images) created\n");
-  }
+  create_swapchain(swapchain_scratch.arena, app, &swapchain_format);
+  arena_temp_end(swapchain_scratch);
+  printf("vk::Swapchain (and images) created\n");
+  printf("vk::ImageView (for swapchain) created\n");
 
   // @image views
   {
-    if (app->swapchain_images_count == 0) {
-      fprintf(stderr, "Vulkan error: swapchain is empty\n");
-      cleanup(app);
-      return -1;
-    }
-
-    app->swapchain_image_views = ARENA_PUSH_ARRAY(
-        app->vulkan_arena, app->swapchain_images_count, VkImageView);
-    VkImageViewCreateInfo image_view_create_info = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = swapchain_format.format,
-        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                             .baseMipLevel =
-                                 0, // only mip 0 => image view for swapchain
-                             .levelCount = 1,
-                             .baseArrayLayer =
-                                 0, // only layer 0 => texture 2D normal (not
-                                    // cubemap or multiviewVR)
-                             .layerCount = 1},
-        // TODO experiment with swizzle
-        .components = {
-            .r = VK_COMPONENT_SWIZZLE_R,
-            .g = VK_COMPONENT_SWIZZLE_G,
-            .b = VK_COMPONENT_SWIZZLE_B,
-            .a = VK_COMPONENT_SWIZZLE_A,
-        }};
-
-    for (u32 i = 0; i < app->swapchain_images_count; i++) {
-      image_view_create_info.image = app->swapchain_images[i];
-      result = vkCreateImageView(app->device, &image_view_create_info, NULL,
-                                 &app->swapchain_image_views[i]);
-      if (result != VK_SUCCESS) {
-        fprintf(stderr,
-                "Vulkan error: failed to created image view for swapchain "
-                "image %u",
-                i);
-        cleanup(app);
-        return -1;
-      }
-    }
-
-    printf("vk::ImageView (for swapchain) created\n");
   }
-  arena_temp_end(swapchain_scratch);
 
   // @render pipeline
   VkPipelineShaderStageCreateInfo shader_stage_infos[2];
@@ -457,20 +318,15 @@ static int init_vulkan(Application *app) {
 
     Str shader_code = {0};
     read_shader_file(scratch.arena, "./build/shaders/slang.spv", &shader_code);
-    str_print_hex(&shader_code);
+    // str_print_hex(&shader_code);
 
     VkShaderModule shader_module;
     VkShaderModuleCreateInfo createInfo = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = shader_code.length,
         .pCode = (const u32 *)shader_code.value};
-    result =
-        vkCreateShaderModule(app->device, &createInfo, NULL, &shader_module);
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: Failed to create shader module\n");
-      cleanup(app);
-      return -1;
-    }
+    VKTRY(vkCreateShaderModule(app->device, &createInfo, NULL, &shader_module),
+          "Vulkan error: Failed to create shader module");
 
     VkPipelineShaderStageCreateInfo vertex_stage_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -485,7 +341,6 @@ static int init_vulkan(Application *app) {
 
     shader_stage_infos[0] = vertex_stage_info;
     shader_stage_infos[1] = fragment_stage_info;
-    printf("%p\n", (void *)shader_stage_infos);
 
     VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT,
                                        VK_DYNAMIC_STATE_SCISSOR};
@@ -503,11 +358,12 @@ static int init_vulkan(Application *app) {
 
     VkViewport viewport = {.x = 0.0f,
                            .y = 0.0f,
-                           .width = (f32)swap_extent.width,
-                           .height = (f32)swap_extent.height,
+                           .width = (f32)app->swap_extent.width,
+                           .height = (f32)app->swap_extent.height,
                            .minDepth = 0.0f,
                            .maxDepth = 1.0f};
-    VkRect2D scissor = {.offset = (VkOffset2D){0, 0}, .extent = swap_extent};
+    VkRect2D scissor = {.offset = (VkOffset2D){0, 0},
+                        .extent = app->swap_extent};
     VkPipelineViewportStateCreateInfo viewport_state = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
         .viewportCount = 1,
@@ -546,13 +402,9 @@ static int init_vulkan(Application *app) {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 0,
         .pushConstantRangeCount = 0};
-    result = vkCreatePipelineLayout(app->device, &pipeline_layout_info, NULL,
-                                    &pipeline_layout);
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: Failed to create pipeline layout\n");
-      cleanup(app);
-      return -1;
-    }
+    VKTRY(vkCreatePipelineLayout(app->device, &pipeline_layout_info, NULL,
+                                 &pipeline_layout),
+          "Vulkan error: Failed to create pipeline layout");
     VkPipelineRenderingCreateInfo pipeline_rendering_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .colorAttachmentCount = 1,
@@ -572,8 +424,9 @@ static int init_vulkan(Application *app) {
         .renderPass = NULL,
         .pNext = &pipeline_rendering_info};
 
-    result = vkCreateGraphicsPipelines(app->device, VK_NULL_HANDLE, 1,
-                                       &pipeline_info, NULL, &app->pipeline);
+    VKTRY(vkCreateGraphicsPipelines(app->device, VK_NULL_HANDLE, 1,
+                                    &pipeline_info, NULL, &app->pipeline),
+          "Vulkan error: Failed to create graphics pipeline");
     arena_temp_end(scratch);
   }
 
@@ -590,12 +443,16 @@ static int init_vulkan(Application *app) {
       cleanup(app);
       return -1;
     }
+        .queueFamilyIndex = app->graphic_queue_index};
+    VKTRY(
+        vkCreateCommandPool(app->device, &pool_info, NULL, &app->graphic_command_pool),
+        "Vulkan error: Failed to create command pool");
 
     VkCommandBufferAllocateInfo alloc_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = app->command_pool,
+        .commandPool = app->graphic_command_pool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1};
+        .commandBufferCount = app->inflight_count};
 
     result = vkAllocateCommandBuffers(app->device, &alloc_info,
                                       &app->command_buffer);
@@ -604,64 +461,247 @@ static int init_vulkan(Application *app) {
       cleanup(app);
       return -1;
     }
+    app->graphic_command_buffers = ARENA_PUSH_ARRAY(
+        app->vulkan_arena, app->inflight_count, VkCommandBuffer);
+    VKTRY(vkAllocateCommandBuffers(app->device, &alloc_info,
+                                   app->graphic_command_buffers),
+          "Vulkan error: Failed to allocate command buffers");
+    app->graphic_command_buffers = ARENA_PUSH_ARRAY(
+        app->vulkan_arena, app->inflight_count, VkCommandBuffer);
+    VKTRY(vkAllocateCommandBuffers(app->device, &alloc_info,
+                                   app->graphic_command_buffers),
+          "Vulkan error: Failed to allocate command buffers");
   }
 
   // @sync object
   {
-    result =
-        vkCreateSemaphore(app->device,
-                          &(VkSemaphoreCreateInfo){
-                              .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-                          },
-                          NULL, &app->present_sema);
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: Failed to create present semaphore\n");
-      cleanup(app);
-      return -1;
+    app->image_available_semas =
+        ARENA_PUSH_ARRAY(app->vulkan_arena, app->inflight_count, VkSemaphore);
+    app->draw_fences =
+        ARENA_PUSH_ARRAY(app->vulkan_arena, app->inflight_count, VkFence);
+    for (u32 i = 0; i < app->inflight_count; i++) {
+      VKTRY(vkCreateSemaphore(
+                app->device,
+                &(VkSemaphoreCreateInfo){
+                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                },
+                NULL, &app->image_available_semas[i]),
+            "Vulkan error: Failed to create present semaphore");
+      VKTRY(vkCreateFence(app->device,
+                          &(VkFenceCreateInfo){
+                              .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                              .flags = VK_FENCE_CREATE_SIGNALED_BIT},
+                          NULL, &app->draw_fences[i]),
+            "Vulkan error: Failed to create draw fence");
     }
-    result =
-        vkCreateSemaphore(app->device,
-                          &(VkSemaphoreCreateInfo){
-                              .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-                          },
-                          NULL, &app->render_sema);
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: Failed to create render semaphore\n");
-      cleanup(app);
-      return -1;
-    }
-
-    result = vkCreateFence(app->device,
-                           &(VkFenceCreateInfo){
-                               .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-                               .flags = VK_FENCE_CREATE_SIGNALED_BIT
-                           },
-                           NULL, &app->draw_fence);
-    if (result != VK_SUCCESS) {
-      fprintf(stderr, "Vulkan error: Failed to create draw fence\n");
-      cleanup(app);
-      return -1;
+    app->render_finish_semas = ARENA_PUSH_ARRAY(
+        app->vulkan_arena, app->swapchain_images_count, VkSemaphore);
+    for (u32 i = 0; i < app->swapchain_images_count; i++) {
+      VKTRY(vkCreateSemaphore(
+                app->device,
+                &(VkSemaphoreCreateInfo){
+                    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                },
+                NULL, &app->render_finish_semas[i]),
+            "Vulkan error: Failed to create a render semaphore");
     }
   }
 
   return 0;
 }
 
-static void cleanup(Application *app) {
-  if (app->command_buffer != VK_NULL_HANDLE) {
+int create_swapchain(Arena *arena, Application *app,
+                     VkSurfaceFormatKHR *swapchain_format) {
+
+  VkSurfaceCapabilitiesKHR capabilities;
+  vkGetPhysicalDeviceSurfaceCapabilitiesKHR(app->physical_device, app->surface,
+                                            &capabilities);
+  app->swap_extent = capabilities.currentExtent;
+
+  if (app->swap_extent.width == UINT32_MAX) {
+    int w, h;
+    glfwGetFramebufferSize(app->window, &w, &h);
+    app->swap_extent = (VkExtent2D){
+        .width = clamp((u32)w, capabilities.minImageExtent.width,
+                       capabilities.maxImageExtent.width),
+        .height = clamp((u32)h, capabilities.minImageExtent.height,
+                        capabilities.maxImageExtent.height),
+    };
   }
 
-  if (app->command_pool != VK_NULL_HANDLE) {
-    vkDestroyCommandPool(app->device, app->command_pool, NULL);
+  u32 swap_image_count = max(3, capabilities.minImageCount);
+  if (0 < capabilities.maxImageCount &&
+      capabilities.maxImageCount < swap_image_count) {
+    swap_image_count = capabilities.maxImageCount;
   }
 
+  u32 formats_count;
+  vkGetPhysicalDeviceSurfaceFormatsKHR(app->physical_device, app->surface,
+                                       &formats_count, NULL);
+  if (formats_count == 0) {
+    fprintf(stderr, "Vulkan error: no present mode available\n");
+    cleanup(app);
+    return -1;
+  }
+  VkSurfaceFormatKHR *available_formats =
+      ARENA_PUSH_ARRAY(arena, formats_count, VkSurfaceFormatKHR);
+  vkGetPhysicalDeviceSurfaceFormatsKHR(app->physical_device, app->surface,
+                                       &formats_count, available_formats);
+
+  u32 format_index = 0;
+  for (u32 i = 0; i < formats_count; i++) {
+    if (available_formats[i].format == VK_FORMAT_B8G8R8A8_SRGB &&
+        available_formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+      format_index = i;
+      break;
+    }
+  }
+  VkSurfaceFormatKHR format = available_formats[format_index];
+  if (swapchain_format != NULL) {
+    *swapchain_format = format;
+  }
+
+  u32 present_modes_count;
+  vkGetPhysicalDeviceSurfacePresentModesKHR(app->physical_device, app->surface,
+                                            &present_modes_count, NULL);
+  if (present_modes_count == 0) {
+    fprintf(stderr, "Vulkan error: no present mode available\n");
+    cleanup(app);
+    return -1;
+  }
+  VkPresentModeKHR *available_present_modes =
+      ARENA_PUSH_ARRAY(arena, present_modes_count, VkPresentModeKHR);
+  vkGetPhysicalDeviceSurfacePresentModesKHR(app->physical_device, app->surface,
+                                            &present_modes_count,
+                                            available_present_modes);
+
+  u32 present_mode_index = 0;
+  for (u32 i = 0; i < present_modes_count; i++) {
+    if (available_present_modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
+      present_mode_index = i;
+      break;
+    }
+    if (available_present_modes[i] == VK_PRESENT_MODE_FIFO_KHR) {
+      present_mode_index = i;
+    }
+  }
+
+  VkSwapchainCreateInfoKHR swapchain_create_info = {
+      .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+      .surface = app->surface,
+      .minImageCount = swap_image_count,
+      .imageFormat = format.format,
+      .imageColorSpace = format.colorSpace,
+      .imageExtent = app->swap_extent,
+      .imageArrayLayers = 1,
+      .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+      .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .preTransform = capabilities.currentTransform,
+      .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+      .presentMode = available_present_modes[present_mode_index],
+      .clipped = true};
+
+  VKTRY(vkCreateSwapchainKHR(app->device, &swapchain_create_info, NULL,
+                             &app->swapchain),
+        "Vulkan error: unable to create swapchain");
+
+  // allocate only on initialization (suppose count will not change)
+  if (app->swapchain_images_count == 0) {
+    VKTRY(vkGetSwapchainImagesKHR(app->device, app->swapchain,
+                                  &app->swapchain_images_count, NULL),
+          "Vulkan error: unable to get swapchain image count");
+    app->swapchain_images = ARENA_PUSH_ARRAY(
+        app->vulkan_arena, app->swapchain_images_count, VkImage);
+  } else {
+    printf("recreate\n");
+  }
+  vkGetSwapchainImagesKHR(app->device, app->swapchain,
+                          &app->swapchain_images_count, app->swapchain_images);
+
+  if (app->swapchain_images_count == 0) {
+    fprintf(stderr, "Vulkan error: swapchain is empty\n");
+    cleanup(app);
+    return -1;
+  }
+
+  app->swapchain_image_views = ARENA_PUSH_ARRAY(
+      app->vulkan_arena, app->swapchain_images_count, VkImageView);
+  VkImageViewCreateInfo image_view_create_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = format.format,
+      .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                           .baseMipLevel =
+                               0, // only mip 0 => image view for swapchain
+                           .levelCount = 1,
+                           .baseArrayLayer =
+                               0, // only layer 0 => texture 2D normal (not
+                                  // cubemap or multiviewVR)
+                           .layerCount = 1},
+      // TODO experiment with swizzle
+      .components = {
+          .r = VK_COMPONENT_SWIZZLE_R,
+          .g = VK_COMPONENT_SWIZZLE_G,
+          .b = VK_COMPONENT_SWIZZLE_B,
+          .a = VK_COMPONENT_SWIZZLE_A,
+      }};
+
+  for (u32 i = 0; i < app->swapchain_images_count; i++) {
+    image_view_create_info.image = app->swapchain_images[i];
+    VKTRY(vkCreateImageView(app->device, &image_view_create_info, NULL,
+                            &app->swapchain_image_views[i]),
+          "Vulkan error: failed to created image view for a swapchain image");
+  }
+
+  return 0;
+}
+
+int cleanup_swapchain(Application *app) {
   if (app->swapchain_image_views != VK_NULL_HANDLE) {
-    for (u32 i = 0; i < app->swapchain_images_count; i++)
+    for (u32 i = 0; i < app->swapchain_images_count; i++) {
+      printf("%i => %p\n", i, (void *)app->swapchain_image_views[i]);
       vkDestroyImageView(app->device, app->swapchain_image_views[i], NULL);
+      app->swapchain_image_views[i] = VK_NULL_HANDLE;
+    }
   }
 
-  if (app->swapchain != VK_NULL_HANDLE)
+  // voluntarily keep swapchain image allocate, suppose swapchain image count
+  // will not change
+  if (app->swapchain != VK_NULL_HANDLE) {
     vkDestroySwapchainKHR(app->device, app->swapchain, NULL);
+    app->swapchain = VK_NULL_HANDLE;
+  }
+
+  return 0;
+}
+
+// @Clean up
+static void cleanup(Application *app) {
+  if (app->image_available_semas != NULL) {
+    for (u32 i = 0; i < app->inflight_count; i++) {
+      vkDestroySemaphore(app->device, app->image_available_semas[i], NULL);
+    }
+  }
+  if (app->render_finish_semas != NULL) {
+    for (u32 i = 0; i < app->inflight_count; i++) {
+      vkDestroySemaphore(app->device, app->render_finish_semas[i], NULL);
+    }
+  }
+  if (app->draw_fences != NULL) {
+    for (u32 i = 0; i < app->inflight_count; i++) {
+      vkDestroyFence(app->device, app->draw_fences[i], NULL);
+    }
+  }
+
+  if (app->graphic_command_buffers != NULL) {
+    vkFreeCommandBuffers(app->device, app->graphic_command_pool, 1,
+                         app->graphic_command_buffers);
+  }
+  if (app->graphic_command_pool != VK_NULL_HANDLE) {
+    vkDestroyCommandPool(app->device, app->graphic_command_pool, NULL);
+  }
+
+  cleanup_swapchain(app);
 
   if (app->device != VK_NULL_HANDLE)
     vkDestroyDevice(app->device, NULL);
@@ -683,13 +723,15 @@ static void cleanup(Application *app) {
   glfwTerminate();
 }
 
-void transition_image_layout(Application *app, u32 imageIndex,
-                             VkImageLayout old_layout, VkImageLayout new_layout,
+void transition_image_layout(Application *app, VkCommandBuffer command_buffer,
+                             u32 image_index, VkImageLayout old_layout,
+                             VkImageLayout new_layout,
                              VkAccessFlags2 src_access_mask,
                              VkAccessFlags2 dst_access_mask,
                              VkPipelineStageFlags2 src_stage_mask,
                              VkPipelineStageFlags2 dst_stage_mask) {
   VkImageMemoryBarrier2 barrier = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
       .srcStageMask = src_stage_mask,
       .srcAccessMask = src_access_mask,
       .dstStageMask = dst_stage_mask,
@@ -698,7 +740,7 @@ void transition_image_layout(Application *app, u32 imageIndex,
       .newLayout = new_layout,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image = (app->swapchain_images)[imageIndex],
+      .image = (app->swapchain_images)[image_index],
       .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                            .baseMipLevel = 0,
                            .levelCount = 1,
@@ -711,9 +753,27 @@ void transition_image_layout(Application *app, u32 imageIndex,
                                       .imageMemoryBarrierCount = 1,
                                       .pImageMemoryBarriers = &barrier};
 
-  vkCmdPipelineBarrier2(app->command_buffer, &dependency_info);
+  vkCmdPipelineBarrier2(command_buffer, &dependency_info);
 }
 
+static void framebuffer_resize_callback(GLFWwindow *window, int width,
+                                        int height) {
+
+  printf("GLFW Resize (width=%4i; height=%4i)\n", width, height);
+  f64 start_time = now_seconds();
+  Application *app = glfwGetWindowUserPointer(window);
+
+  vkDeviceWaitIdle(app->device);
+
+  cleanup_swapchain(app);
+
+  ArenaTemp temp = arena_temp_begin(app->scratch_arena);
+  create_swapchain(temp.arena, app, NULL);
+  arena_temp_end(temp);
+  f64 end_time = now_seconds();
+  f64 elapsed = end_time - start_time;
+  printf("resizing take %.2fms.\n", elapsed * 1000);
+}
 static int init_glfw_window(Application *app) {
   if (!glfwInit()) {
     fprintf(stderr, "Failed to initialize GLFW\n");
@@ -721,56 +781,61 @@ static int init_glfw_window(Application *app) {
   }
 
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-  glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+  // glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
-  app->window = glfwCreateWindow(800, 600, "Vulkan", NULL, NULL);
+  app->window = glfwCreateWindow(1000, 1000, "Vulkan", NULL, NULL);
+
+  glfwSetWindowUserPointer(app->window, app);
+  glfwSetFramebufferSizeCallback(app->window, framebuffer_resize_callback);
 
   if (app->window == NULL) {
     fprintf(stderr, "Failed to create GLFW window\n");
-    glfwTerminate();
     return -1;
   }
 
   printf("GLFW window created\n");
+  int win_w, win_h;
+  int fb_w, fb_h;
+
+  glfwGetWindowSize(app->window, &win_w, &win_h);
+  glfwGetFramebufferSize(app->window, &fb_w, &fb_h);
+
+  printf("window size: %d x %d\n", win_w, win_h);
+  printf("framebuffer size: %d x %d\n", fb_w, fb_h);
 
   return 0;
 }
 
 int draw_frame(Application *app) {
   // await for previous frame to be drawn
-  VkResult result =
-      vkWaitForFences(app->device, 1, &app->draw_fence, true, UINT64_MAX);
-  if (result != VK_SUCCESS) {
-    fprintf(stderr, "Draw frame error: unable to wait for draw fence");
-    return -1;
-  }
-  result = vkResetFences(app->device, 1, &app->draw_fence);
-  if (result != VK_SUCCESS) {
-    fprintf(stderr, "Draw frame error: unable to reset draw fence");
-    return -1;
-  }
+  VKTRY(vkWaitForFences(app->device, 1, &app->draw_fences[app->frame_index],
+                        true, UINT64_MAX),
+        "Draw frame error: unable to wait for draw fence");
+  VKTRY(vkResetFences(app->device, 1, &app->draw_fences[app->frame_index]),
+        "Draw frame error: unable to reset draw fence");
+
+  VkCommandBuffer *current_command_buffer =
+      &app->graphic_command_buffers[app->frame_index];
 
   // acquire next image from swapchain
   uint32_t image_index = 0;
-  result = vkAcquireNextImageKHR(app->device, app->swapchain, UINT64_MAX,
-                                 app->present_sema, NULL, &image_index);
-  if (result != VK_SUCCESS) {
-    fprintf(stderr,
-            "Draw frame error: unable to acquire next image from swapchain");
-    return -1;
-  }
+  VKTRY(vkAcquireNextImageKHR(app->device, app->swapchain, UINT64_MAX,
+                              app->image_available_semas[app->frame_index],
+                              NULL, &image_index),
+        "Draw frame error: unable to acquire next image from swapchain");
+  VKTRY(vkResetCommandBuffer(*current_command_buffer, 0),
+        "Draw frame error: unable to reset the command buffer");
 
   // draw command recording
-  vkBeginCommandBuffer(app->command_buffer,
+  vkBeginCommandBuffer(*current_command_buffer,
                        &(VkCommandBufferBeginInfo){
                            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                        });
 
   transition_image_layout(
-      app,
-      image_index, // todo change
-      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
-      (VkAccessFlags2){}, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      app, *current_command_buffer, image_index, VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, (VkAccessFlags2){},
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
   VkRenderingAttachmentInfo attachment_info = {
@@ -787,86 +852,101 @@ int draw_frame(Application *app) {
       .colorAttachmentCount = 1,
       .pColorAttachments = &attachment_info};
 
-  vkCmdBeginRendering(app->command_buffer, &rendering_info);
+  vkCmdBeginRendering(*current_command_buffer, &rendering_info);
 
-  vkCmdBindPipeline(app->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+  vkCmdBindPipeline(*current_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     app->pipeline);
 
   vkCmdSetViewport(app->command_buffer, 0., 1.,
+  // dynamic
+  vkCmdSetViewport(*current_command_buffer, 0., 1.,
                    &(VkViewport){0., 0., (f32)app->swap_extent.width,
-                                 (f32)app->swap_extent.width, 0., 1.});
-  vkCmdSetScissor(app->command_buffer, 0., 1.,
+                                 (f32)app->swap_extent.height, 0., 1.});
+  vkCmdSetScissor(*current_command_buffer, 0., 1.,
                   &(VkRect2D){{0, 0}, app->swap_extent});
 
-  vkCmdDraw(app->command_buffer, 3, 1, 0, 0);
+  vkCmdDraw(*current_command_buffer, vertices_count, 1, 0, 0);
 
-  vkCmdEndRendering(app->command_buffer);
+  vkCmdEndRendering(*current_command_buffer);
 
   transition_image_layout(
-      app,
-      image_index, // todo change
+      app, *current_command_buffer, image_index,
       VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, (VkAccessFlags2){},
       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
-  vkEndCommandBuffer(app->command_buffer);
+  vkEndCommandBuffer(*current_command_buffer);
 
   // submit command buffer to queue
   const VkPipelineStageFlags wait_dst_stage_mask =
       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
   const VkSubmitInfo submit_info = {
-
       .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
       .waitSemaphoreCount = 1,
-      .pWaitSemaphores = &app->present_sema,
+      .pWaitSemaphores = &app->image_available_semas[app->frame_index],
       .pWaitDstStageMask = &wait_dst_stage_mask,
       .commandBufferCount = 1,
-      .pCommandBuffers = &app->command_buffer,
+      .pCommandBuffers = current_command_buffer,
       .signalSemaphoreCount = 1,
-      .pSignalSemaphores = &app->render_sema};
+      .pSignalSemaphores = &app->render_finish_semas[image_index]};
+  vkQueueSubmit(app->graphic_queue, 1, &submit_info,
+                app->draw_fences[app->frame_index]);
 
-  vkQueueSubmit(app->graphic_queue, 1, &submit_info, app->draw_fence);
+  const VkPresentInfoKHR present_info = {
+      .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+      .waitSemaphoreCount = 1,
+      .pWaitSemaphores = &app->render_finish_semas[image_index],
+      .swapchainCount = 1,
+      .pSwapchains = &app->swapchain,
+      .pImageIndices = &image_index};
+  VKTRY(vkQueuePresentKHR(app->graphic_queue, &present_info),
+        "Draw frame error: unable to present image");
 
-  const VkPresentInfoKHR present_info = {.sType =
-                                             VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-                                         .waitSemaphoreCount = 1,
-                                         .pWaitSemaphores = &app->render_sema,
-                                         .swapchainCount = 1,
-                                         .pSwapchains = &app->swapchain,
-                                         .pImageIndices = &image_index};
-  result = vkQueuePresentKHR(app->graphic_queue, &present_info);
-  if (result != VK_SUCCESS) {
-    fprintf(stderr,
-            "Draw frame error: unable to present image");
-    return -1;
-  }
+  app->frame_index = (app->frame_index + 1) % app->inflight_count;
 
   return 0;
 }
 
 //@ MainLoop
 static void main_loop(Application *app) {
-  printf("hi\n");
+  char title[64];
+  f64 last_time = now_seconds();
+  uint32_t frame_count = 0;
   while (!glfwWindowShouldClose(app->window)) {
-    printf("start\n");
-    // glfwPollEvents();
+    glfwPollEvents();
     draw_frame(app);
-    printf("ha\n");
+    frame_count++;
+
+    f64 current_time = now_seconds();
+    f64 elapsed = current_time - last_time;
+
+    if (elapsed >= 1.0) {
+      f64 fps = (f64)frame_count / elapsed;
+
+      printf("FPS: %.1f\n", fps);
+
+      frame_count = 0;
+      last_time = current_time;
+      snprintf(title, sizeof(title), "Vulkan - FPS: %.1f", fps);
+      glfwSetWindowTitle(app->window, title);
+    }
   }
-  printf("hum\n");
 }
 
 int main(void) {
   Application app = {0};
 
-  if (init_glfw_window(&app) != 0)
+  if (init_glfw_window(&app) != 0) {
+    cleanup(&app);
     return EXIT_FAILURE;
+  }
 
-  if (init_vulkan(&app) != 0)
+  if (init_vulkan(&app) != 0) {
+    cleanup(&app);
     return EXIT_FAILURE;
+  }
 
-  printf("oi\n");
   main_loop(&app);
   cleanup(&app);
 
