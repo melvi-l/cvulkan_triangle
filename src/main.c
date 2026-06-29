@@ -60,6 +60,8 @@ typedef struct Application {
 
   VkBuffer vertex_buffer;
   VkDeviceMemory vertex_buffer_memory;
+  VkBuffer index_buffer;
+  VkDeviceMemory index_buffer_memory;
 
   u32 graphic_queue_index;
   VkQueue graphic_queue;
@@ -92,13 +94,10 @@ bool get_layers(Arena *arena, u32 *layer_count, const char ***layer_properties);
 
 bool read_shader_file(Arena *arena, const char *path, Str *out);
 
-int create_buffer(Application *app, VkDeviceSize size, VkBufferUsageFlags usage,
-                  VkMemoryPropertyFlags properties, VkSharingMode sharing_mode,
-                  uint32_t queueFamilyIndexCount,
-                  const uint32_t *pQueueFamilyIndices, VkBuffer *buffer,
-                  VkDeviceMemory *memory);
-int copy_buffer(VkQueue queue, VkCommandBuffer cmd, VkBuffer *src,
-                VkBuffer *dst, VkDeviceSize size);
+int upload_array(Application *app, void *array, VkDeviceSize buffer_size,
+                 VkBufferUsageFlags additional_usage, VkBuffer *buffer,
+
+                 VkDeviceMemory *memory);
 
 static int init_vulkan(Application *app);
 int create_swapchain(Arena *arena, Application *app,
@@ -113,11 +112,14 @@ void transition_image_layout(Application *app, VkCommandBuffer command_buffer,
                              VkPipelineStageFlags2 src_stage_mask,
                              VkPipelineStageFlags2 dst_stage_mask);
 
-#define vertices_count 3
+#define vertices_count 4
 static Vertex vertices[vertices_count] = {
-    {{{0.0f, -0.5f}}, {{1.0f, 0.0f, 0.0f}}},
-    {{{0.5f, 0.5f}}, {{0.0f, 1.0f, 0.0f}}},
-    {{{-0.5f, 0.5f}}, {{0.0f, 0.0f, 1.0f}}}};
+    {{{-0.5f, -0.5f}}, {{1.0f, 0.0f, 0.0f}}},
+    {{{0.5f, -0.5f}}, {{0.0f, 1.0f, 0.0f}}},
+    {{{0.5f, 0.5f}}, {{0.0f, 0.0f, 1.0f}}},
+    {{{-0.5f, 0.5f}}, {{1.0f, 1.0f, 1.0f}}}};
+#define indices_count 6
+static u16 indices[indices_count] = {0, 1, 2, 2, 3, 0};
 
 //@ Init
 static int init_vulkan(Application *app) {
@@ -138,6 +140,8 @@ static int init_vulkan(Application *app) {
   app->pipeline = VK_NULL_HANDLE;
   app->vertex_buffer = VK_NULL_HANDLE;
   app->vertex_buffer_memory = VK_NULL_HANDLE;
+  app->index_buffer = VK_NULL_HANDLE;
+  app->index_buffer_memory = VK_NULL_HANDLE;
   app->graphic_command_pool = VK_NULL_HANDLE;
   app->graphic_command_buffers = NULL;
   app->image_available_semas = NULL;
@@ -281,7 +285,6 @@ static int init_vulkan(Application *app) {
       printf("Unable to find another queue than graphic for transfer.\n");
       app->transfer_queue_index = app->graphic_queue_index;
     }
-
 
     // verify swapchain extension
     u32 extension_count = 0;
@@ -516,7 +519,7 @@ static int init_vulkan(Application *app) {
 
     VkCommandPoolCreateInfo transfer_pool_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags = 0,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = app->transfer_queue_index};
     VKTRY(vkCreateCommandPool(app->device, &transfer_pool_info, NULL,
                               &app->transfer_command_pool),
@@ -534,50 +537,16 @@ static int init_vulkan(Application *app) {
 
   // @buffer (vertex)
   {
-    VkDeviceSize buffer_size = sizeof(vertices[0]) * vertices_count;
-    VkBuffer staging_buffer = VK_NULL_HANDLE;
-    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
-    if (create_buffer(app, buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      VK_SHARING_MODE_EXCLUSIVE, 0, NULL, &staging_buffer,
-                      &staging_memory) != 0) {
+    if (upload_array(app, vertices, sizeof(vertices) * vertices_count,
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &app->vertex_buffer,
+                     &app->vertex_buffer_memory) != 0) {
       return -1;
-    };
-
-    // RAM -> HOST_VISIBLE
-    void *data;
-    VKTRY(vkMapMemory(app->device, staging_memory, 0, buffer_size, 0, &data),
-          "Vulkan error: Failed to map memory for vertex buffer");
-
-    memcpy(data, vertices, buffer_size);
-    vkUnmapMemory(app->device, staging_memory);
-
-    VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
-    u32 queue_family_count = 0;
-    u32 *queue_families = NULL;
-
-    if (app->graphic_queue_index != app->transfer_queue_index) {
-      sharing_mode = VK_SHARING_MODE_CONCURRENT;
-      queue_family_count = 2;
-      queue_families =
-          (u32[2]){app->graphic_queue_index, app->transfer_queue_index};
     }
-
-    if (create_buffer(app, buffer_size,
-                      VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sharing_mode,
-                      queue_family_count, queue_families, &app->vertex_buffer,
-                      &app->vertex_buffer_memory) != 0) {
+    if (upload_array(app, indices, sizeof(indices) * indices_count,
+                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &app->index_buffer,
+                     &app->index_buffer_memory) != 0) {
       return -1;
-    };
-
-    // HOST_VISIBLE -> DEVICE_LOCAL
-    if (copy_buffer(app->transfer_queue, app->transfer_command_buffer,
-                    &staging_buffer, &app->vertex_buffer, buffer_size) != 0) {
-      return -1;
-    };
+    }
   }
 
   // @sync object
@@ -784,13 +753,15 @@ int cleanup_swapchain(Application *app) {
 
 // @Clean up
 static void cleanup(Application *app) {
+  vkDeviceWaitIdle(app->device);
+
   if (app->image_available_semas != NULL) {
     for (u32 i = 0; i < app->inflight_count; i++) {
       vkDestroySemaphore(app->device, app->image_available_semas[i], NULL);
     }
   }
   if (app->render_finish_semas != NULL) {
-    for (u32 i = 0; i < app->inflight_count; i++) {
+    for (u32 i = 0; i < app->swapchain_images_count; i++) {
       vkDestroySemaphore(app->device, app->render_finish_semas[i], NULL);
     }
   }
@@ -804,6 +775,11 @@ static void cleanup(Application *app) {
     vkDestroyBuffer(app->device, app->vertex_buffer, NULL);
   if (app->vertex_buffer_memory != VK_NULL_HANDLE)
     vkFreeMemory(app->device, app->vertex_buffer_memory, NULL);
+
+  if (app->index_buffer != VK_NULL_HANDLE)
+    vkDestroyBuffer(app->device, app->index_buffer, NULL);
+  if (app->index_buffer_memory != VK_NULL_HANDLE)
+    vkFreeMemory(app->device, app->index_buffer_memory, NULL);
 
   if (app->graphic_command_buffers != NULL) {
     vkFreeCommandBuffers(app->device, app->graphic_command_pool,
@@ -986,6 +962,8 @@ int draw_frame(Application *app) {
   VkDeviceSize offsets[] = {0};
   vkCmdBindVertexBuffers(*current_command_buffer, 0, 1, vertex_buffers,
                          offsets);
+  vkCmdBindIndexBuffer(*current_command_buffer, app->index_buffer, 0,
+                       VK_INDEX_TYPE_UINT16);
 
   // dynamic
   vkCmdSetViewport(*current_command_buffer, 0., 1.,
@@ -994,7 +972,7 @@ int draw_frame(Application *app) {
   vkCmdSetScissor(*current_command_buffer, 0., 1.,
                   &(VkRect2D){{0, 0}, app->swap_extent});
 
-  vkCmdDraw(*current_command_buffer, vertices_count, 1, 0, 0);
+  vkCmdDrawIndexed(*current_command_buffer, indices_count, 1, 0, 0, 0);
 
   vkCmdEndRendering(*current_command_buffer);
 
@@ -1311,6 +1289,55 @@ int copy_buffer(VkQueue queue, VkCommandBuffer cmd, VkBuffer *src,
         "Vulkan error: Failed to submit transfer command buffer");
 
   VKTRY(vkQueueWaitIdle(queue), "Vulkan error: Failed to wait transfer queue");
+  return 0;
+}
+int upload_array(Application *app, void *array, VkDeviceSize buffer_size,
+                 VkBufferUsageFlags additional_usage, VkBuffer *buffer,
+                 VkDeviceMemory *memory) {
+  VkBuffer staging_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+  if (create_buffer(app, buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, &staging_buffer,
+                    &staging_memory) != 0) {
+    return -1;
+  };
+
+  // RAM -> HOST_VISIBLE
+  void *data;
+  VKTRY(vkMapMemory(app->device, staging_memory, 0, buffer_size, 0, &data),
+        "Vulkan error: Failed to map memory for vertex buffer");
+
+  memcpy(data, array, buffer_size);
+  vkUnmapMemory(app->device, staging_memory);
+
+  VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
+  u32 queue_family_count = 0;
+  u32 *queue_families = NULL;
+
+  if (app->graphic_queue_index != app->transfer_queue_index) {
+    sharing_mode = VK_SHARING_MODE_CONCURRENT;
+    queue_family_count = 2;
+    queue_families =
+        (u32[2]){app->graphic_queue_index, app->transfer_queue_index};
+  }
+
+  if (create_buffer(app, buffer_size,
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT | additional_usage,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sharing_mode,
+                    queue_family_count, queue_families, buffer, memory) != 0) {
+    return -1;
+  };
+
+  // HOST_VISIBLE -> DEVICE_LOCAL
+  if (copy_buffer(app->transfer_queue, app->transfer_command_buffer,
+                  &staging_buffer, buffer, buffer_size) != 0) {
+    return -1;
+  };
+
+  vkDestroyBuffer(app->device, staging_buffer, NULL);
+  vkFreeMemory(app->device, staging_memory, NULL);
   return 0;
 }
 static VkVertexInputBindingDescription vertex_get_binding_description() {

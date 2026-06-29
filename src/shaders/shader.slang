@@ -13,7 +13,6 @@ static float3 colors[3] = float3[](
 struct VIn {
     float2 position;
     float3 color;
-
 }
 
 struct VOut {
