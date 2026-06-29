@@ -58,10 +58,18 @@ typedef struct Application {
   VkPipelineLayout pipeline_layout;
   VkPipeline pipeline;
 
+  VkDescriptorSetLayout descriptor_set_layout;
+  VkDescriptorPool descriptor_pool;
+  VkDescriptorSet *descriptor_sets;
+
   VkBuffer geometry_buffer;
-  VkDeviceMemory geometry_buffer_memory;
+  VkDeviceMemory geometry_memory;
   VkDeviceSize vertex_offset;
   VkDeviceSize index_offset;
+
+  VkBuffer *uniform_buffers;
+  VkDeviceMemory *uniform_memories;
+  void **uniform_buffers_mapped;
 
   u32 graphic_queue_index;
   VkQueue graphic_queue;
@@ -82,6 +90,11 @@ typedef struct Vertex {
   Vec2 position;
   Vec3 color;
 } Vertex;
+typedef struct UniformBufferObject {
+  Mat4 model;
+  Mat4 view;
+  Mat4 proj;
+} UniformBufferObject;
 static VkVertexInputBindingDescription vertex_get_binding_description();
 static void vertex_get_attribut_description(
     VkVertexInputAttributeDescription description[2]);
@@ -94,9 +107,13 @@ bool get_layers(Arena *arena, u32 *layer_count, const char ***layer_properties);
 
 bool read_shader_file(Arena *arena, const char *path, Str *out);
 
+int create_buffer(Application *app, VkDeviceSize size, VkBufferUsageFlags usage,
+                  VkMemoryPropertyFlags properties, VkSharingMode sharing_mode,
+                  uint32_t queueFamilyIndexCount,
+                  const uint32_t *pQueueFamilyIndices, VkBuffer *buffer,
+                  VkDeviceMemory *memory);
 int upload_array(Application *app, void *array, VkDeviceSize buffer_size,
                  VkBufferUsageFlags additional_usage, VkBuffer *buffer,
-
                  VkDeviceMemory *memory);
 
 static int init_vulkan(Application *app);
@@ -138,17 +155,23 @@ static int init_vulkan(Application *app) {
   app->swapchain_images = VK_NULL_HANDLE;
   app->swapchain_image_views = VK_NULL_HANDLE;
   app->pipeline = VK_NULL_HANDLE;
+  app->descriptor_set_layout = VK_NULL_HANDLE;
+  app->descriptor_pool = VK_NULL_HANDLE;
+  app->descriptor_pool = NULL;
   app->geometry_buffer = VK_NULL_HANDLE;
-  app->geometry_buffer_memory = VK_NULL_HANDLE;
+  app->geometry_memory = VK_NULL_HANDLE;
   app->geometry_buffer = 0;
-  app->geometry_buffer_memory = 0;
+  app->geometry_memory = 0;
+  app->uniform_buffers = VK_NULL_HANDLE;
+  app->uniform_memories = VK_NULL_HANDLE;
+  app->uniform_buffers_mapped = NULL;
   app->graphic_command_pool = VK_NULL_HANDLE;
   app->graphic_command_buffers = NULL;
   app->image_available_semas = NULL;
   app->render_finish_semas = NULL;
   app->draw_fences = NULL;
 
-  // @instance
+  // @instanc
   {
     ArenaTemp scratch = arena_temp_begin(app->scratch_arena);
     u32 extension_count;
@@ -365,8 +388,20 @@ static int init_vulkan(Application *app) {
   printf("vk::Swapchain (and images) created\n");
   printf("vk::ImageView (for swapchain) created\n");
 
-  // @image views
+  // @descriptor set layout
   {
+    VkDescriptorSetLayoutBinding ubo_layout_binding = {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT};
+    VkDescriptorSetLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1,
+        .pBindings = &ubo_layout_binding};
+    VKTRY(vkCreateDescriptorSetLayout(app->device, &layout_info, NULL,
+                                      &app->descriptor_set_layout),
+          "Vulkan error: Failed to create ubo descriptor set layout");
   }
 
   // @render pipeline
@@ -442,7 +477,7 @@ static int init_vulkan(Application *app) {
         .rasterizerDiscardEnable = false,
         .polygonMode = VK_POLYGON_MODE_FILL, // TODO test all the MODE
         .cullMode = VK_CULL_MODE_BACK_BIT,
-        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
         .depthBiasEnable = false,
         .lineWidth = 1.0f};
 
@@ -464,7 +499,8 @@ static int init_vulkan(Application *app) {
 
     VkPipelineLayoutCreateInfo pipeline_layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 0,
+        .setLayoutCount = 1,
+        .pSetLayouts = &app->descriptor_set_layout,
         .pushConstantRangeCount = 0};
     VKTRY(vkCreatePipelineLayout(app->device, &pipeline_layout_info, NULL,
                                  &app->pipeline_layout),
@@ -552,10 +588,85 @@ static int init_vulkan(Application *app) {
     if (upload_array(app, geometry_array, geometry_size,
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                     &app->geometry_buffer,
-                     &app->geometry_buffer_memory) != 0) {
+                     &app->geometry_buffer, &app->geometry_memory) != 0) {
       return -1;
     }
+  }
+  // @buffer (uniform)
+  {
+    VkDeviceSize uniform_size = sizeof(UniformBufferObject);
+
+    app->uniform_buffers =
+        ARENA_PUSH_ARRAY(app->vulkan_arena, app->inflight_count, VkBuffer);
+    app->uniform_memories = ARENA_PUSH_ARRAY(
+        app->vulkan_arena, app->inflight_count, VkDeviceMemory);
+    app->uniform_buffers_mapped =
+        ARENA_PUSH_ARRAY(app->vulkan_arena, app->inflight_count, void *);
+
+    for (u32 i = 0; i < app->inflight_count; i++) {
+      create_buffer(app, uniform_size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+                    &app->uniform_buffers[i], &app->uniform_memories[i]);
+      VKTRY(vkMapMemory(app->device, app->uniform_memories[i], 0, uniform_size,
+                        0, &app->uniform_buffers_mapped[i]),
+            "Vulkan error: Failed to map memory for uniform buffer");
+    }
+  }
+
+  // @descriptor sets
+  {
+    ArenaTemp tmp = arena_temp_begin(app->scratch_arena);
+    // pool
+    printf("pool\n");
+    VkDescriptorPoolSize pool_size = {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                      .descriptorCount = app->inflight_count};
+    VkDescriptorPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        .maxSets = app->inflight_count,
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size};
+    VKTRY(vkCreateDescriptorPool(app->device, &pool_info, NULL,
+                                 &app->descriptor_pool),
+          "Vulkan error: failed to create descriptor pool");
+
+    // set
+    VkDescriptorSetLayout *layouts =
+        ARENA_PUSH_ARRAY(tmp.arena, app->inflight_count, VkDescriptorSetLayout);
+    for (u32 i = 0; i < app->inflight_count; i++) {
+      layouts[i] = app->descriptor_set_layout;
+    }
+
+    app->descriptor_sets = ARENA_PUSH_ARRAY(
+        app->vulkan_arena, app->inflight_count, VkDescriptorSet);
+    VkDescriptorSetAllocateInfo allocate_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = app->descriptor_pool,
+        .descriptorSetCount = app->inflight_count,
+        .pSetLayouts = layouts};
+    VKTRY(vkAllocateDescriptorSets(app->device, &allocate_info,
+                                   app->descriptor_sets),
+          "Vulkan error: failed to allocate descriptor sets");
+
+    printf("write\n");
+    for (u32 i = 0; i < app->inflight_count; i++) {
+      VkDescriptorBufferInfo buffer_info = {.buffer = app->uniform_buffers[i],
+                                            .offset = 0,
+                                            .range =
+                                                sizeof(UniformBufferObject)};
+      VkWriteDescriptorSet descriptor_write = {
+          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+          .dstSet = app->descriptor_sets[i],
+          .dstBinding = 0,
+          .dstArrayElement = 0,
+          .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+          .pBufferInfo = &buffer_info};
+      vkUpdateDescriptorSets(app->device, 1, &descriptor_write, 0, NULL);
+    }
+    arena_temp_end(tmp);
   }
 
   // @sync object
@@ -782,8 +893,8 @@ static void cleanup(Application *app) {
 
   if (app->geometry_buffer != VK_NULL_HANDLE)
     vkDestroyBuffer(app->device, app->geometry_buffer, NULL);
-  if (app->geometry_buffer_memory != VK_NULL_HANDLE)
-    vkFreeMemory(app->device, app->geometry_buffer_memory, NULL);
+  if (app->geometry_memory != VK_NULL_HANDLE)
+    vkFreeMemory(app->device, app->geometry_memory, NULL);
 
   if (app->graphic_command_buffers != NULL) {
     vkFreeCommandBuffers(app->device, app->graphic_command_pool,
@@ -968,6 +1079,32 @@ int draw_frame(Application *app) {
                          offsets);
   vkCmdBindIndexBuffer(*current_command_buffer, app->geometry_buffer,
                        app->index_offset, VK_INDEX_TYPE_UINT16);
+
+  // uniform
+  {
+    static f64 start = 0.;
+    if (start == 0.) {
+      start = now_seconds();
+    }
+    f64 current = now_seconds();
+    f32 time = (f32)(current - start);
+
+    UniformBufferObject ubo = {};
+    ubo.model = Rotate_RH(time * DegToRad * 90.f, V3(0.f, 0.f, 1.f));
+    ubo.view =
+        LookAt_RH(V3(2.f, 2.f, 2.f), V3(0.f, 0.f, 0.f), V3(0.f, 0.f, 1.f));
+    ubo.proj = Perspective_RH_ZO(
+        45, (f32)app->swap_extent.width / (f32)app->swap_extent.height, .1f,
+        10.f);
+    ubo.proj.Elements[1][1] *= -1.f;
+
+    memcpy(app->uniform_buffers_mapped[app->frame_index], &ubo, sizeof(ubo));
+
+    vkCmdBindDescriptorSets(*current_command_buffer,
+                            VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            app->pipeline_layout, 0, 1,
+                            &app->descriptor_sets[app->frame_index], 0, NULL);
+  }
 
   // dynamic
   vkCmdSetViewport(*current_command_buffer, 0., 1.,

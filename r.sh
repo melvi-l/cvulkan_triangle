@@ -7,7 +7,7 @@ BUILD_DIR="./build"
 EXEC="app"
 MODE="${1:-debug}"
 
-COMMON_LIBS="-lglfw -lvulkan"
+COMMON_LIBS="-lm -lglfw -lvulkan"
 
 mkdir -p "$BUILD_DIR"
 mkdir -p "$BUILD_DIR/shaders"
