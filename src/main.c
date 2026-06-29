@@ -9,6 +9,15 @@
 
 #include "lib/math.h"
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Wsign-conversion"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "lib/image.h"
+
+#pragma GCC diagnostic pop
+
 #include "base.c"
 
 #ifdef VK_ENABLE_VALIDATION
@@ -62,6 +71,11 @@ typedef struct Application {
   VkDescriptorPool descriptor_pool;
   VkDescriptorSet *descriptor_sets;
 
+  VkImage texture_image;
+  VkDeviceMemory texture_memory;
+  VkImageView texture_view;
+  VkSampler texture_sampler;
+
   VkBuffer geometry_buffer;
   VkDeviceMemory geometry_memory;
   VkDeviceSize vertex_offset;
@@ -89,6 +103,7 @@ typedef struct Application {
 typedef struct Vertex {
   Vec3 position;
   Vec3 color;
+  Vec2 uv;
 } Vertex;
 typedef struct UniformBufferObject {
   Mat4 model;
@@ -97,7 +112,7 @@ typedef struct UniformBufferObject {
 } UniformBufferObject;
 static VkVertexInputBindingDescription vertex_get_binding_description();
 static void vertex_get_attribut_description(
-    VkVertexInputAttributeDescription description[2]);
+    VkVertexInputAttributeDescription description[3]);
 
 bool get_extensions(Arena *arena, u32 *extension_count,
                     const char ***extension_names);
@@ -116,33 +131,73 @@ int upload_array(Application *app, void *array, VkDeviceSize buffer_size,
                  VkBufferUsageFlags additional_usage, VkBuffer *buffer,
                  VkDeviceMemory *memory);
 
+int create_image(Application *app, u32 width, u32 height, VkFormat format,
+                 VkMemoryPropertyFlags properties, VkImageTiling tiling,
+                 VkImageUsageFlags usage, VkSharingMode sharing_mode,
+                 u32 queue_family_index_count,
+                 const u32 *p_queue_family_indices, VkImage *image,
+                 VkDeviceMemory *memory);
+int copy_buffer_to_image(VkCommandBuffer cmd, u32 w, u32 h, VkBuffer buffer,
+                         VkImage image);
+
 static int init_vulkan(Application *app);
 int create_swapchain(Arena *arena, Application *app,
                      VkSurfaceFormatKHR *swapchain_format);
 static int init_glfw_window(Application *app);
 static void cleanup(Application *app);
-void transition_image_layout(Application *app, VkCommandBuffer command_buffer,
-                             u32 image_index, VkImageLayout old_layout,
-                             VkImageLayout new_layout,
+void transition_image_layout(VkCommandBuffer command_buffer, VkImage image,
+                             VkImageLayout old_layout, VkImageLayout new_layout,
                              VkAccessFlags2 src_access_mask,
                              VkAccessFlags2 dst_access_mask,
                              VkPipelineStageFlags2 src_stage_mask,
-                             VkPipelineStageFlags2 dst_stage_mask);
+                             VkPipelineStageFlags2 dst_stage_mask,
+                             u32 src_queue_family_index,
+                             u32 dst_queue_family_index);
 
-#define vertices_count 8
+#define vertices_count 24
 static Vertex vertices[vertices_count] = {
-    {{{-.5f, -.5f, -.5f}}, {{0.0f, 0.0f, 0.0f}}},
-    {{{-.5f, -.5f, .5f}}, {{0.0f, 0.0f, 1.0f}}},
-    {{{-.5f, .5f, -.5f}}, {{0.0f, 1.0f, 0.0f}}},
-    {{{-.5f, .5f, .5f}}, {{0.0f, 1.0f, 1.0f}}},
-    {{{.5f, -.5f, -.5f}}, {{1.0f, 0.0f, 0.0f}}},
-    {{{.5f, -.5f, .5f}}, {{1.0f, 0.0f, 1.0f}}},
-    {{{.5f, .5f, -.5f}}, {{1.0f, 1.0f, 0.0f}}},
-    {{{.5f, .5f, .5f}}, {{1.0f, 1.0f, 1.0f}}}};
+    // -X
+    {{{-.5f, -.5f, -.5f}}, {{1.0f, 0.0f, 0.0f}}, {{0.f, 1.f}}},
+    {{{-.5f, .5f, -.5f}}, {{1.0f, 0.0f, 0.0f}}, {{0.f, 0.f}}},
+    {{{-.5f, .5f, .5f}}, {{1.0f, 0.0f, 0.0f}}, {{1.f, 0.f}}},
+    {{{-.5f, -.5f, .5f}}, {{1.0f, 0.0f, 0.0f}}, {{1.f, 1.f}}},
+
+    // +X
+    {{{.5f, -.5f, .5f}}, {{0.0f, 1.0f, 0.0f}}, {{0.f, 1.f}}},
+    {{{.5f, .5f, .5f}}, {{0.0f, 1.0f, 0.0f}}, {{0.f, 0.f}}},
+    {{{.5f, .5f, -.5f}}, {{0.0f, 1.0f, 0.0f}}, {{1.f, 0.f}}},
+    {{{.5f, -.5f, -.5f}}, {{0.0f, 1.0f, 0.0f}}, {{1.f, 1.f}}},
+
+    // -Y
+    {{{-.5f, -.5f, .5f}}, {{0.0f, 0.0f, 1.0f}}, {{0.f, 1.f}}},
+    {{{.5f, -.5f, .5f}}, {{0.0f, 0.0f, 1.0f}}, {{1.f, 1.f}}},
+    {{{.5f, -.5f, -.5f}}, {{0.0f, 0.0f, 1.0f}}, {{1.f, 0.f}}},
+    {{{-.5f, -.5f, -.5f}}, {{0.0f, 0.0f, 1.0f}}, {{0.f, 0.f}}},
+
+    // +Y
+    {{{-.5f, .5f, -.5f}}, {{1.0f, 1.0f, 0.0f}}, {{0.f, 1.f}}},
+    {{{.5f, .5f, -.5f}}, {{1.0f, 1.0f, 0.0f}}, {{1.f, 1.f}}},
+    {{{.5f, .5f, .5f}}, {{1.0f, 1.0f, 0.0f}}, {{1.f, 0.f}}},
+    {{{-.5f, .5f, .5f}}, {{1.0f, 1.0f, 0.0f}}, {{0.f, 0.f}}},
+
+    // -Z
+    {{{.5f, -.5f, -.5f}}, {{1.0f, 0.0f, 1.0f}}, {{0.f, 1.f}}},
+    {{{.5f, .5f, -.5f}}, {{1.0f, 0.0f, 1.0f}}, {{0.f, 0.f}}},
+    {{{-.5f, .5f, -.5f}}, {{1.0f, 0.0f, 1.0f}}, {{1.f, 0.f}}},
+    {{{-.5f, -.5f, -.5f}}, {{1.0f, 0.0f, 1.0f}}, {{1.f, 1.f}}},
+
+    // +Z
+    {{{-.5f, -.5f, .5f}}, {{0.0f, 1.0f, 1.0f}}, {{0.f, 1.f}}},
+    {{{-.5f, .5f, .5f}}, {{0.0f, 1.0f, 1.0f}}, {{0.f, 0.f}}},
+    {{{.5f, .5f, .5f}}, {{0.0f, 1.0f, 1.0f}}, {{1.f, 0.f}}},
+    {{{.5f, -.5f, .5f}}, {{0.0f, 1.0f, 1.0f}}, {{1.f, 1.f}}},
+};
+
 #define indices_count 36
-static u16 indices[indices_count] = {0, 1, 2, 1, 3, 2, 0, 5, 1, 5, 0, 4,
-                                     4, 7, 5, 7, 4, 6, 6, 2, 7, 2, 3, 7,
-                                     7, 3, 5, 3, 1, 5, 0, 2, 4, 2, 6, 4};
+static u16 indices[indices_count] = {
+    0,  1,  2,  2,  3,  0,  4,  5,  6,  6,  7,  4,  8,  9,  10, 10, 11, 8,
+    12, 13, 14, 14, 15, 12, 16, 17, 18, 18, 19, 16, 20, 21, 22, 22, 23, 20,
+};
 
 //@ Init
 static int init_vulkan(Application *app) {
@@ -164,6 +219,10 @@ static int init_vulkan(Application *app) {
   app->descriptor_set_layout = VK_NULL_HANDLE;
   app->descriptor_pool = VK_NULL_HANDLE;
   app->descriptor_pool = NULL;
+  app->texture_view = VK_NULL_HANDLE;
+  app->texture_sampler = VK_NULL_HANDLE;
+  app->texture_image = VK_NULL_HANDLE;
+  app->texture_memory = VK_NULL_HANDLE;
   app->geometry_buffer = VK_NULL_HANDLE;
   app->geometry_memory = VK_NULL_HANDLE;
   app->geometry_buffer = 0;
@@ -229,8 +288,7 @@ static int init_vulkan(Application *app) {
   // @physical device
   VkPhysicalDeviceVulkan11Features vulkan11_features = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-      .shaderDrawParameters = true,
-  };
+      .shaderDrawParameters = true};
   VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state_features =
       {.sType =
            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
@@ -240,6 +298,7 @@ static int init_vulkan(Application *app) {
       .pNext = &extended_dynamic_state_features};
   VkPhysicalDeviceFeatures2 device_features = (VkPhysicalDeviceFeatures2){
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+      .features = {.samplerAnisotropy = true},
       .pNext = &vulkan13_features};
   const char *required_device_extension_names[] = {
       VK_KHR_SWAPCHAIN_EXTENSION_NAME};
@@ -396,15 +455,19 @@ static int init_vulkan(Application *app) {
 
   // @descriptor set layout
   {
-    VkDescriptorSetLayoutBinding ubo_layout_binding = {
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT};
+    VkDescriptorSetLayoutBinding bindings[2] = {
+        {.binding = 0,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT},
+        {.binding = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT}};
     VkDescriptorSetLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
-        .pBindings = &ubo_layout_binding};
+        .bindingCount = 2,
+        .pBindings = bindings};
     VKTRY(vkCreateDescriptorSetLayout(app->device, &layout_info, NULL,
                                       &app->descriptor_set_layout),
           "Vulkan error: Failed to create ubo descriptor set layout");
@@ -449,13 +512,13 @@ static int init_vulkan(Application *app) {
         .pDynamicStates = dynamic_states};
 
     VkVertexInputBindingDescription binding = vertex_get_binding_description();
-    VkVertexInputAttributeDescription attributes[2];
+    VkVertexInputAttributeDescription attributes[3];
     vertex_get_attribut_description(attributes);
     VkPipelineVertexInputStateCreateInfo vertex_input_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = 1,
         .pVertexBindingDescriptions = &binding,
-        .vertexAttributeDescriptionCount = 2,
+        .vertexAttributeDescriptionCount = 3,
         .pVertexAttributeDescriptions = attributes,
     };
     VkPipelineInputAssemblyStateCreateInfo input_assembly_info = {
@@ -482,7 +545,7 @@ static int init_vulkan(Application *app) {
         .depthClampEnable = false,
         .rasterizerDiscardEnable = false,
         .polygonMode = VK_POLYGON_MODE_FILL, // TODO test all the MODE
-        .cullMode = VK_CULL_MODE_BACK_BIT,
+        .cullMode = VK_CULL_MODE_NONE,
         .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
         .depthBiasEnable = false,
         .lineWidth = 1.0f};
@@ -577,6 +640,200 @@ static int init_vulkan(Application *app) {
           "Vulkan error: Failed to allocate transfer command buffer");
   }
 
+  // @image texture
+  {
+    int tex_w, tex_h, tex_chan;
+    stbi_uc *pixels =
+        stbi_load("textures/us.jpg", &tex_w, &tex_h, &tex_chan, STBI_rgb_alpha);
+    VkDeviceSize image_size = (u32)tex_w * (u32)tex_h * 4u;
+    if (!pixels || tex_w <= 0 || tex_h <= 0) {
+      fprintf(stderr, "stb_image error: failed to load image\n");
+      return -1;
+    }
+
+    VkBuffer staging_buffer;
+    VkDeviceMemory staging_memory;
+    if (create_buffer(app, image_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      VK_SHARING_MODE_EXCLUSIVE, 0, NULL, &staging_buffer,
+                      &staging_memory) != 0) {
+      return -1;
+    }
+    void *data;
+    VKTRY(vkMapMemory(app->device, staging_memory, 0, image_size, 0, &data),
+          "Vulkan error: Failed to map memory for vertex buffer");
+
+    memcpy(data, pixels, image_size);
+    vkUnmapMemory(app->device, staging_memory);
+
+    stbi_image_free(pixels);
+
+    if (create_image(
+            app, (u32)tex_w, (u32)tex_h, VK_FORMAT_R8G8B8A8_SRGB,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_SHARING_MODE_EXCLUSIVE, 0, NULL, &app->texture_image,
+            &app->texture_memory) != 0) {
+      return -1;
+    }
+
+    VKTRY(vkBeginCommandBuffer(
+              app->transfer_command_buffer,
+              &(VkCommandBufferBeginInfo){
+                  .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                  .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+              }),
+          "Vulkan error: Failed to begin transfer command buffer");
+
+    transition_image_layout(
+        app->transfer_command_buffer, app->texture_image,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_NONE,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED);
+
+    copy_buffer_to_image(app->transfer_command_buffer, (u32)tex_w, (u32)tex_h,
+                         staging_buffer, app->texture_image);
+
+    transition_image_layout(app->transfer_command_buffer, app->texture_image,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_ACCESS_2_TRANSFER_WRITE_BIT, 0,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_2_NONE, app->transfer_queue_index,
+                            app->graphic_queue_index);
+
+    VkSemaphore texture_upload_semaphore;
+    vkCreateSemaphore(app->device,
+                      &(VkSemaphoreCreateInfo){
+                          .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO},
+                      NULL, &texture_upload_semaphore);
+
+    VKTRY(vkEndCommandBuffer(app->transfer_command_buffer),
+          "Vulkan error: Failed to end transfer command buffer");
+    VKTRY(vkQueueSubmit2(
+              app->transfer_queue, 1,
+              &(VkSubmitInfo2){
+                  .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                  .commandBufferInfoCount = 1,
+                  .pCommandBufferInfos =
+                      &(VkCommandBufferSubmitInfo){
+                          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                          .commandBuffer = app->transfer_command_buffer,
+                      },
+                  .signalSemaphoreInfoCount = 1,
+                  .pSignalSemaphoreInfos =
+                      &(VkSemaphoreSubmitInfo){
+                          .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                          .semaphore = texture_upload_semaphore,
+                          .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      },
+              },
+              VK_NULL_HANDLE),
+          "Vulkan error: Failed to submit texture upload and ownership "
+          "transfer for texture image");
+
+    VkCommandBuffer graphics_upload_cmd;
+    VKTRY(vkAllocateCommandBuffers(
+              app->device,
+              &(VkCommandBufferAllocateInfo){
+                  .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                  .commandPool = app->graphic_command_pool,
+                  .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                  .commandBufferCount = 1,
+              },
+              &graphics_upload_cmd),
+          "Vulkan error: failed to allocate graphics upload command buffer");
+    VKTRY(vkBeginCommandBuffer(
+              graphics_upload_cmd,
+              &(VkCommandBufferBeginInfo){
+                  .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                  .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+              }),
+          "Vulkan error: failed to begin graphics upload command buffer");
+
+    transition_image_layout(
+        graphics_upload_cmd, app->texture_image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_PIPELINE_STAGE_2_NONE,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, app->transfer_queue_index,
+        app->graphic_queue_index);
+
+    VKTRY(vkEndCommandBuffer(graphics_upload_cmd),
+          "Vulkan error: failed to end graphics upload command buffer");
+
+    VkFence upload_fence;
+    vkCreateFence(app->device,
+                  &(VkFenceCreateInfo){
+                      .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                  },
+                  NULL, &upload_fence);
+
+    VkSubmitInfo2 graphics_submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .waitSemaphoreInfoCount = 1,
+        .pWaitSemaphoreInfos =
+            &(VkSemaphoreSubmitInfo){
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .semaphore = texture_upload_semaphore,
+                .stageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            },
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &(VkCommandBufferSubmitInfo){
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+            .commandBuffer = graphics_upload_cmd,
+        }};
+
+    vkQueueSubmit2(app->graphic_queue, 1, &graphics_submit, upload_fence);
+    vkWaitForFences(app->device, 1, &upload_fence, VK_TRUE, UINT64_MAX);
+
+    vkDestroyFence(app->device, upload_fence, NULL);
+    vkDestroySemaphore(app->device, texture_upload_semaphore, NULL);
+
+    vkFreeCommandBuffers(app->device, app->graphic_command_pool, 1,
+                         &graphics_upload_cmd);
+
+    vkDestroyBuffer(app->device, staging_buffer, NULL);
+    vkFreeMemory(app->device, staging_memory, NULL);
+
+    // view
+    vkCreateImageView(
+        app->device,
+        &(VkImageViewCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = app->texture_image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_SRGB,
+            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                 .baseMipLevel = 0,
+                                 .levelCount = 1,
+                                 .baseArrayLayer = 0,
+                                 .layerCount = 1}},
+        NULL, &app->texture_view);
+
+    // sampler
+    VkPhysicalDeviceProperties2 properties = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    vkGetPhysicalDeviceProperties2(app->physical_device, &properties);
+    vkCreateSampler(
+        app->device,
+        &(VkSamplerCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .magFilter = VK_FILTER_LINEAR,
+            .minFilter = VK_FILTER_LINEAR,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .anisotropyEnable = VK_TRUE,
+            .maxAnisotropy = properties.properties.limits.maxSamplerAnisotropy,
+            .compareEnable = VK_FALSE,
+            .compareOp = VK_COMPARE_OP_ALWAYS},
+        NULL, &app->texture_sampler);
+  };
+
   // @buffer (vertex & index)
   {
     ArenaTemp temp = arena_temp_begin(app->scratch_arena);
@@ -626,14 +883,17 @@ static int init_vulkan(Application *app) {
     ArenaTemp tmp = arena_temp_begin(app->scratch_arena);
     // pool
     printf("pool\n");
-    VkDescriptorPoolSize pool_size = {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                                      .descriptorCount = app->inflight_count};
+    VkDescriptorPoolSize pool_size[2] = {
+        {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .descriptorCount = app->inflight_count},
+        {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+         .descriptorCount = app->inflight_count}};
     VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
         .maxSets = app->inflight_count,
-        .poolSizeCount = 1,
-        .pPoolSizes = &pool_size};
+        .poolSizeCount = 2,
+        .pPoolSizes = pool_size};
     VKTRY(vkCreateDescriptorPool(app->device, &pool_info, NULL,
                                  &app->descriptor_pool),
           "Vulkan error: failed to create descriptor pool");
@@ -662,15 +922,30 @@ static int init_vulkan(Application *app) {
                                             .offset = 0,
                                             .range =
                                                 sizeof(UniformBufferObject)};
-      VkWriteDescriptorSet descriptor_write = {
-          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = app->descriptor_sets[i],
-          .dstBinding = 0,
-          .dstArrayElement = 0,
-          .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-          .pBufferInfo = &buffer_info};
-      vkUpdateDescriptorSets(app->device, 1, &descriptor_write, 0, NULL);
+      VkDescriptorImageInfo image_info = {
+          .sampler = app->texture_sampler,
+          app->texture_view,
+          .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+
+      VkWriteDescriptorSet descriptor_write[2] = {
+          {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+           .dstSet = app->descriptor_sets[i],
+           .dstBinding = 0,
+           .dstArrayElement = 0,
+           .descriptorCount = 1,
+           .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+           .pBufferInfo = &buffer_info},
+          {
+
+              .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+              .dstSet = app->descriptor_sets[i],
+              .dstBinding = 1,
+              .dstArrayElement = 0,
+              .descriptorCount = 1,
+              .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+              .pImageInfo = &image_info},
+      };
+      vkUpdateDescriptorSets(app->device, 2, descriptor_write, 0, NULL);
     }
     arena_temp_end(tmp);
   }
@@ -946,13 +1221,14 @@ static void cleanup(Application *app) {
   glfwTerminate();
 }
 
-void transition_image_layout(Application *app, VkCommandBuffer command_buffer,
-                             u32 image_index, VkImageLayout old_layout,
-                             VkImageLayout new_layout,
+void transition_image_layout(VkCommandBuffer command_buffer, VkImage image,
+                             VkImageLayout old_layout, VkImageLayout new_layout,
                              VkAccessFlags2 src_access_mask,
                              VkAccessFlags2 dst_access_mask,
                              VkPipelineStageFlags2 src_stage_mask,
-                             VkPipelineStageFlags2 dst_stage_mask) {
+                             VkPipelineStageFlags2 dst_stage_mask,
+                             u32 src_queue_family_index,
+                             u32 dst_queue_family_index) {
   VkImageMemoryBarrier2 barrier = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
       .srcStageMask = src_stage_mask,
@@ -961,9 +1237,9 @@ void transition_image_layout(Application *app, VkCommandBuffer command_buffer,
       .dstAccessMask = dst_access_mask,
       .oldLayout = old_layout,
       .newLayout = new_layout,
-      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-      .image = (app->swapchain_images)[image_index],
+      .srcQueueFamilyIndex = src_queue_family_index,
+      .dstQueueFamilyIndex = dst_queue_family_index,
+      .image = image,
       .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                            .baseMipLevel = 0,
                            .levelCount = 1,
@@ -1056,11 +1332,12 @@ int draw_frame(Application *app) {
                        });
 
   transition_image_layout(
-      app, *current_command_buffer, image_index, VK_IMAGE_LAYOUT_UNDEFINED,
-      VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, (VkAccessFlags2){},
-      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+      *current_command_buffer, (app->swapchain_images)[image_index],
+      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+      (VkAccessFlags2){}, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_QUEUE_FAMILY_IGNORED,
+      VK_QUEUE_FAMILY_IGNORED);
   VkRenderingAttachmentInfo attachment_info = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
       .imageView = app->swapchain_image_views[image_index],
@@ -1124,11 +1401,12 @@ int draw_frame(Application *app) {
   vkCmdEndRendering(*current_command_buffer);
 
   transition_image_layout(
-      app, *current_command_buffer, image_index,
+      *current_command_buffer, (app->swapchain_images)[image_index],
       VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, (VkAccessFlags2){},
-      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, (VkAccessFlags2){},
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_QUEUE_FAMILY_IGNORED,
+      VK_QUEUE_FAMILY_IGNORED);
 
   vkEndCommandBuffer(*current_command_buffer);
 
@@ -1375,8 +1653,8 @@ i32 find_memory_type(Application *app, u32 type_filter,
 }
 int create_buffer(Application *app, VkDeviceSize size, VkBufferUsageFlags usage,
                   VkMemoryPropertyFlags properties, VkSharingMode sharing_mode,
-                  uint32_t queueFamilyIndexCount,
-                  const uint32_t *pQueueFamilyIndices, VkBuffer *buffer,
+                  u32 queue_family_index_count,
+                  const u32 *p_queue_family_indices, VkBuffer *buffer,
                   VkDeviceMemory *memory) {
 
   VkBufferCreateInfo buffer_info = {
@@ -1384,8 +1662,8 @@ int create_buffer(Application *app, VkDeviceSize size, VkBufferUsageFlags usage,
       .size = size,
       .usage = usage,
       .sharingMode = sharing_mode,
-      .queueFamilyIndexCount = queueFamilyIndexCount,
-      .pQueueFamilyIndices = pQueueFamilyIndices};
+      .queueFamilyIndexCount = queue_family_index_count,
+      .pQueueFamilyIndices = p_queue_family_indices};
   VKTRY(vkCreateBuffer(app->device, &buffer_info, NULL, buffer),
         "Vulkan error: Failed to create vertex buffer");
   VkMemoryRequirements memory_requirements;
@@ -1494,7 +1772,7 @@ static VkVertexInputBindingDescription vertex_get_binding_description() {
                                                VK_VERTEX_INPUT_RATE_VERTEX};
 }
 static void vertex_get_attribut_description(
-    VkVertexInputAttributeDescription description[2]) {
+    VkVertexInputAttributeDescription description[3]) {
   description[0] =
       (VkVertexInputAttributeDescription){.location = 0,
                                           .binding = 0,
@@ -1505,4 +1783,69 @@ static void vertex_get_attribut_description(
                                           .binding = 0,
                                           .format = VK_FORMAT_R32G32B32_SFLOAT,
                                           .offset = offsetof(Vertex, color)};
+  description[2] =
+      (VkVertexInputAttributeDescription){.location = 2,
+                                          .binding = 0,
+                                          .format = VK_FORMAT_R32G32_SFLOAT,
+                                          .offset = offsetof(Vertex, uv)};
+}
+
+int create_image(Application *app, u32 width, u32 height, VkFormat format,
+                 VkMemoryPropertyFlags properties, VkImageTiling tiling,
+                 VkImageUsageFlags usage, VkSharingMode sharing_mode,
+                 u32 queue_family_index_count,
+                 const u32 *p_queue_family_indices, VkImage *image,
+                 VkDeviceMemory *memory) {
+  VkImageCreateInfo image_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = format,
+      .extent = {width, height, 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = tiling,
+      .usage = usage,
+      .sharingMode = sharing_mode,
+      .queueFamilyIndexCount = queue_family_index_count,
+      .pQueueFamilyIndices = p_queue_family_indices};
+  VKTRY(vkCreateImage(app->device, &image_info, NULL, image),
+        "Vulkan error: failed create texture image");
+
+  VkMemoryRequirements memory_requirements;
+  vkGetImageMemoryRequirements(app->device, *image, &memory_requirements);
+  i32 memory_type_index =
+      find_memory_type(app, memory_requirements.memoryTypeBits, properties);
+  if (memory_type_index < 0) {
+    fprintf(stderr, "Unable to find adequate memory type index.\n");
+    return -1;
+  }
+  VkMemoryAllocateInfo alloc_info = {.sType =
+                                         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                     .allocationSize = memory_requirements.size,
+                                     .memoryTypeIndex = (u32)memory_type_index};
+  VKTRY(vkAllocateMemory(app->device, &alloc_info, NULL, memory),
+        "Vulkan error: failed to allocate memory for image texture");
+  vkBindImageMemory(app->device, *image, *memory, 0);
+  return 0;
+}
+
+int copy_buffer_to_image(VkCommandBuffer cmd, u32 w, u32 h, VkBuffer buffer,
+                         VkImage image) {
+
+  VkBufferImageCopy copy_region = {
+      .bufferOffset = 0,
+      .bufferRowLength = 0,
+      .bufferImageHeight = 0,
+      .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                           .mipLevel = 0,
+                           .baseArrayLayer = 0,
+                           .layerCount = 1},
+      .imageOffset = {0},
+      .imageExtent = {w, h, 1}};
+
+  vkCmdCopyBufferToImage(cmd, buffer, image,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+
+  return 0;
 }
