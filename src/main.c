@@ -58,10 +58,10 @@ typedef struct Application {
   VkPipelineLayout pipeline_layout;
   VkPipeline pipeline;
 
-  VkBuffer vertex_buffer;
-  VkDeviceMemory vertex_buffer_memory;
-  VkBuffer index_buffer;
-  VkDeviceMemory index_buffer_memory;
+  VkBuffer geometry_buffer;
+  VkDeviceMemory geometry_buffer_memory;
+  VkDeviceSize vertex_offset;
+  VkDeviceSize index_offset;
 
   u32 graphic_queue_index;
   VkQueue graphic_queue;
@@ -138,10 +138,10 @@ static int init_vulkan(Application *app) {
   app->swapchain_images = VK_NULL_HANDLE;
   app->swapchain_image_views = VK_NULL_HANDLE;
   app->pipeline = VK_NULL_HANDLE;
-  app->vertex_buffer = VK_NULL_HANDLE;
-  app->vertex_buffer_memory = VK_NULL_HANDLE;
-  app->index_buffer = VK_NULL_HANDLE;
-  app->index_buffer_memory = VK_NULL_HANDLE;
+  app->geometry_buffer = VK_NULL_HANDLE;
+  app->geometry_buffer_memory = VK_NULL_HANDLE;
+  app->geometry_buffer = 0;
+  app->geometry_buffer_memory = 0;
   app->graphic_command_pool = VK_NULL_HANDLE;
   app->graphic_command_buffers = NULL;
   app->image_available_semas = NULL;
@@ -535,16 +535,25 @@ static int init_vulkan(Application *app) {
           "Vulkan error: Failed to allocate transfer command buffer");
   }
 
-  // @buffer (vertex)
+  // @buffer (vertex & index)
   {
-    if (upload_array(app, vertices, sizeof(vertices) * vertices_count,
-                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &app->vertex_buffer,
-                     &app->vertex_buffer_memory) != 0) {
-      return -1;
-    }
-    if (upload_array(app, indices, sizeof(indices) * indices_count,
-                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &app->index_buffer,
-                     &app->index_buffer_memory) != 0) {
+    ArenaTemp temp = arena_temp_begin(app->scratch_arena);
+    VkDeviceSize vertex_size = sizeof(vertices[0]) * vertices_count;
+    VkDeviceSize index_size = sizeof(indices[0]) * indices_count;
+    VkDeviceSize geometry_size = vertex_size + index_size;
+
+    app->vertex_offset = 0;
+    app->index_offset = vertex_size;
+
+    u8 *geometry_array = ARENA_PUSH_ARRAY(temp.arena, geometry_size, u8);
+    memcpy(geometry_array + app->vertex_offset, vertices, vertex_size);
+    memcpy(geometry_array + app->index_offset, indices, index_size);
+
+    if (upload_array(app, geometry_array, geometry_size,
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     &app->geometry_buffer,
+                     &app->geometry_buffer_memory) != 0) {
       return -1;
     }
   }
@@ -771,15 +780,10 @@ static void cleanup(Application *app) {
     }
   }
 
-  if (app->vertex_buffer != VK_NULL_HANDLE)
-    vkDestroyBuffer(app->device, app->vertex_buffer, NULL);
-  if (app->vertex_buffer_memory != VK_NULL_HANDLE)
-    vkFreeMemory(app->device, app->vertex_buffer_memory, NULL);
-
-  if (app->index_buffer != VK_NULL_HANDLE)
-    vkDestroyBuffer(app->device, app->index_buffer, NULL);
-  if (app->index_buffer_memory != VK_NULL_HANDLE)
-    vkFreeMemory(app->device, app->index_buffer_memory, NULL);
+  if (app->geometry_buffer != VK_NULL_HANDLE)
+    vkDestroyBuffer(app->device, app->geometry_buffer, NULL);
+  if (app->geometry_buffer_memory != VK_NULL_HANDLE)
+    vkFreeMemory(app->device, app->geometry_buffer_memory, NULL);
 
   if (app->graphic_command_buffers != NULL) {
     vkFreeCommandBuffers(app->device, app->graphic_command_pool,
@@ -958,12 +962,12 @@ int draw_frame(Application *app) {
 
   vkCmdBindPipeline(*current_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     app->pipeline);
-  VkBuffer vertex_buffers[] = {app->vertex_buffer};
-  VkDeviceSize offsets[] = {0};
+  VkBuffer vertex_buffers[] = {app->geometry_buffer};
+  VkDeviceSize offsets[] = {app->vertex_offset};
   vkCmdBindVertexBuffers(*current_command_buffer, 0, 1, vertex_buffers,
                          offsets);
-  vkCmdBindIndexBuffer(*current_command_buffer, app->index_buffer, 0,
-                       VK_INDEX_TYPE_UINT16);
+  vkCmdBindIndexBuffer(*current_command_buffer, app->geometry_buffer,
+                       app->index_offset, VK_INDEX_TYPE_UINT16);
 
   // dynamic
   vkCmdSetViewport(*current_command_buffer, 0., 1.,
