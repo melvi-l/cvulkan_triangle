@@ -87,7 +87,7 @@ typedef struct Application {
 } Application;
 
 typedef struct Vertex {
-  Vec2 position;
+  Vec3 position;
   Vec3 color;
 } Vertex;
 typedef struct UniformBufferObject {
@@ -129,14 +129,20 @@ void transition_image_layout(Application *app, VkCommandBuffer command_buffer,
                              VkPipelineStageFlags2 src_stage_mask,
                              VkPipelineStageFlags2 dst_stage_mask);
 
-#define vertices_count 4
+#define vertices_count 8
 static Vertex vertices[vertices_count] = {
-    {{{-0.5f, -0.5f}}, {{1.0f, 0.0f, 0.0f}}},
-    {{{0.5f, -0.5f}}, {{0.0f, 1.0f, 0.0f}}},
-    {{{0.5f, 0.5f}}, {{0.0f, 0.0f, 1.0f}}},
-    {{{-0.5f, 0.5f}}, {{1.0f, 1.0f, 1.0f}}}};
-#define indices_count 6
-static u16 indices[indices_count] = {0, 1, 2, 2, 3, 0};
+    {{{-.5f, -.5f, -.5f}}, {{0.0f, 0.0f, 0.0f}}},
+    {{{-.5f, -.5f, .5f}}, {{0.0f, 0.0f, 1.0f}}},
+    {{{-.5f, .5f, -.5f}}, {{0.0f, 1.0f, 0.0f}}},
+    {{{-.5f, .5f, .5f}}, {{0.0f, 1.0f, 1.0f}}},
+    {{{.5f, -.5f, -.5f}}, {{1.0f, 0.0f, 0.0f}}},
+    {{{.5f, -.5f, .5f}}, {{1.0f, 0.0f, 1.0f}}},
+    {{{.5f, .5f, -.5f}}, {{1.0f, 1.0f, 0.0f}}},
+    {{{.5f, .5f, .5f}}, {{1.0f, 1.0f, 1.0f}}}};
+#define indices_count 36
+static u16 indices[indices_count] = {0, 1, 2, 1, 3, 2, 0, 5, 1, 5, 0, 4,
+                                     4, 7, 5, 7, 4, 6, 6, 2, 7, 2, 3, 7,
+                                     7, 3, 5, 3, 1, 5, 0, 2, 4, 2, 6, 4};
 
 //@ Init
 static int init_vulkan(Application *app) {
@@ -1090,7 +1096,7 @@ int draw_frame(Application *app) {
     f32 time = (f32)(current - start);
 
     UniformBufferObject ubo = {};
-    ubo.model = Rotate_RH(time * DegToRad * 90.f, V3(0.f, 0.f, 1.f));
+    ubo.model = Rotate_RH(time * DegToRad * 90.f, V3(1.f, 0.f, 1.f));
     ubo.view =
         LookAt_RH(V3(2.f, 2.f, 2.f), V3(0.f, 0.f, 0.f), V3(0.f, 0.f, 1.f));
     ubo.proj = Perspective_RH_ZO(
@@ -1492,7 +1498,7 @@ static void vertex_get_attribut_description(
   description[0] =
       (VkVertexInputAttributeDescription){.location = 0,
                                           .binding = 0,
-                                          .format = VK_FORMAT_R32G32_SFLOAT,
+                                          .format = VK_FORMAT_R32G32B32_SFLOAT,
                                           .offset = offsetof(Vertex, position)},
   description[1] =
       (VkVertexInputAttributeDescription){.location = 1,
